@@ -272,6 +272,9 @@
       <button onclick="switchMainView('global')" id="btn-view-global" class="main-tab-btn px-3.5 py-2 text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition">
         本地全局用量
       </button>
+      <button onclick="switchMainView('kernel')" id="btn-view-kernel" class="main-tab-btn px-3.5 py-2 text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition">
+        内核设置
+      </button>
     </div>
 
     <!-- ========================================== -->
@@ -473,6 +476,144 @@
 
     </div>
 
+    <!-- ========================================== -->
+    <!-- VIEW 3: KERNEL SETTINGS (Context Unlock & Built-in Prompt Editor) -->
+    <!-- ========================================== -->
+    <div id="view-kernel" class="hidden space-y-4">
+
+      <!-- Target Detection & Inspection Island Card -->
+      <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-4 shadow-sm space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <div class="text-xs font-semibold text-[var(--foreground)]">目标程序检测 (Language Server)</div>
+            <div class="text-[10px] text-[var(--muted-foreground)]">进入本页时自动扫描本地候选目标；检测结果决定可用的修改能力</div>
+          </div>
+          <span id="kernel-busy" class="text-[10px] font-mono text-[var(--muted-foreground)] hidden">处理中...</span>
+        </div>
+
+        <select id="kernel-target-select" onchange="onKernelTargetChange()" class="w-full text-xs font-mono rounded-lg border border-[var(--border)] bg-[var(--onyx-key)] text-[var(--foreground)] px-2.5 py-1.5 shadow-[var(--onyx-key-shadow)] outline-none disabled:opacity-50"></select>
+
+        <div id="kernel-message" class="hidden text-xs rounded-lg border border-[var(--primary)]/40 bg-[var(--primary)]/10 text-[var(--foreground)] px-3 py-2"></div>
+        <div id="kernel-error" class="hidden text-xs rounded-lg border border-[var(--pie-crit)]/50 bg-[var(--pie-crit)]/10 text-[var(--foreground)] px-3 py-2"></div>
+        <div id="kernel-warning" class="hidden text-[11px] rounded-lg border border-[var(--pie-warn)]/50 bg-[var(--pie-warn)]/10 text-[var(--foreground)] px-3 py-2"></div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+          <div class="bg-[var(--card-subtle)] p-2.5 rounded-lg border border-[var(--border)] space-y-1">
+            <div class="text-[10px] text-[var(--muted-foreground)]">文件路径</div>
+            <div id="kernel-path" class="font-mono text-[11px] text-[var(--foreground)] break-all select-text">--</div>
+            <div class="text-[10px] text-[var(--muted-foreground)] pt-1">文件指纹 (SHA-256)</div>
+            <div id="kernel-hash" class="font-mono text-[10px] text-[var(--muted-foreground)] break-all select-text">--</div>
+          </div>
+          <div class="bg-[var(--card-subtle)] p-2.5 rounded-lg border border-[var(--border)] space-y-1">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-[10px] text-[var(--muted-foreground)]">格式 / 架构</span>
+              <span id="kernel-arch" class="font-mono text-[11px] text-[var(--foreground)]">--</span>
+            </div>
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-[10px] text-[var(--muted-foreground)]">上下文解锁</span>
+              <span id="kernel-context-supported" class="font-mono text-[11px] text-[var(--foreground)]">--</span>
+            </div>
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-[10px] text-[var(--muted-foreground)]">磁盘模式</span>
+              <span id="kernel-context-mode" class="font-mono text-[11px] text-[var(--foreground)]">--</span>
+            </div>
+            <div id="kernel-context-reason-row" class="hidden">
+              <div class="text-[10px] text-[var(--muted-foreground)]">不支持原因</div>
+              <div id="kernel-context-reason" class="text-[10px] text-[var(--muted-foreground)] leading-relaxed">--</div>
+            </div>
+            <div class="flex items-center justify-between gap-2 pt-1 border-t border-[var(--border-subtle)]">
+              <span class="text-[10px] text-[var(--muted-foreground)]">原始备份</span>
+              <span id="kernel-backup-status" class="font-mono text-[11px] text-[var(--foreground)]">--</span>
+            </div>
+            <div id="kernel-backup-path-row" class="hidden">
+              <div class="text-[10px] text-[var(--muted-foreground)]">备份路径</div>
+              <div id="kernel-backup-path" class="font-mono text-[10px] text-[var(--muted-foreground)] break-all select-text">--</div>
+            </div>
+          </div>
+        </div>
+
+        <details class="space-y-1.5">
+          <summary class="text-[10px] text-[var(--muted-foreground)] cursor-pointer">检测详情</summary>
+          <div id="kernel-gates-list" class="space-y-1"></div>
+        </details>
+      </div>
+
+      <!-- Restart Required Banner (disk config vs live telemetry) -->
+      <div id="kernel-restart-banner" class="hidden bg-[var(--card)] border border-[var(--pie-warn)]/50 rounded-xl p-3.5 shadow-sm space-y-1">
+        <div class="flex items-center gap-2 text-xs font-semibold text-[var(--foreground)]">
+          <span class="w-1.5 h-1.5 rounded-full bg-[var(--pie-warn)] flex-shrink-0"></span>
+          <span>需要手动重启 Antigravity 才能生效</span>
+        </div>
+        <div id="kernel-restart-detail" class="text-[11px] text-[var(--muted-foreground)] font-mono leading-relaxed"></div>
+      </div>
+
+      <!-- Context Unlock Card -->
+      <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-4 shadow-sm space-y-3">
+        <div>
+          <div class="text-xs font-semibold text-[var(--foreground)]">上下文窗口解锁 (Context Unlock)</div>
+          <div class="text-[10px] text-[var(--muted-foreground)]">与下方提示词编辑相互独立，需分别显式应用，切换选项不会自动写入</div>
+        </div>
+        <div class="inline-flex items-center space-x-1 bg-[var(--onyx-well)] p-1 rounded-lg border border-[var(--border-subtle)]">
+          <button type="button" id="kernel-mode-stock" onclick="setKernelMode('stock')" class="range-btn px-3 py-1 rounded-md text-[11px]" disabled>原生 (Stock)</button>
+          <button type="button" id="kernel-mode-512k" onclick="setKernelMode('512k')" class="range-btn px-3 py-1 rounded-md text-[11px]" disabled>512K</button>
+          <button type="button" id="kernel-mode-900k" onclick="setKernelMode('900k')" class="range-btn px-3 py-1 rounded-md text-[11px]" disabled>900K</button>
+        </div>
+        <div class="text-[11px] text-[var(--muted-foreground)] leading-relaxed bg-[var(--card-subtle)] border border-[var(--border)] rounded-lg px-3 py-2 space-y-1">
+          <div>· 512K 模式：压缩回退预算与显示上限均为 <span class="font-mono">512,000</span> tokens。</div>
+          <div>· 900K 模式：压缩回退预算设为 <span class="font-mono">900,000</span> tokens，客户端界面显示约 <span class="font-mono">983,040</span>。</div>
+          <div>· 服务端模型自身的真实限额不会被修改：超出所选模型服务端上限的请求仍可能被拒绝或截断。</div>
+        </div>
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <span id="kernel-context-live" class="text-[10px] font-mono text-[var(--muted-foreground)]">运行遥测: --</span>
+          <button id="kernel-apply-context-btn" onclick="applyKernelContext()" class="px-3.5 py-1.5 text-xs rounded-lg font-medium bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm hover:opacity-90 active:scale-95 transition disabled:opacity-40 disabled:cursor-not-allowed" disabled>应用上下文设置</button>
+        </div>
+      </div>
+
+      <!-- Built-in Prompt Editor Card -->
+      <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-4 shadow-sm space-y-3">
+        <div>
+          <div class="text-xs font-semibold text-[var(--foreground)]">内置提示词编辑器 (Built-in Prompts)</div>
+          <div class="text-[10px] text-[var(--muted-foreground)]">与上方上下文解锁相互独立，需分别显式保存，切换模板不会自动写入</div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <select id="kernel-template-select" onchange="onKernelTemplateChange()" class="flex-1 min-w-[180px] text-xs font-mono rounded-lg border border-[var(--border)] bg-[var(--onyx-key)] text-[var(--foreground)] px-2.5 py-1.5 shadow-[var(--onyx-key-shadow)] outline-none disabled:opacity-50"></select>
+          <span id="kernel-template-meta" class="text-[10px] font-mono text-[var(--muted-foreground)]">--</span>
+        </div>
+        <textarea id="kernel-template-editor" oninput="onKernelEditorInput()" spellcheck="false" class="w-full h-44 font-mono text-[11px] leading-relaxed rounded-lg border border-[var(--border)] bg-[var(--onyx-well)] text-[var(--foreground)] px-3 py-2 outline-none resize-y disabled:opacity-50" placeholder="选择上方模板以查看内容"></textarea>
+        <div id="kernel-editor-dirty" class="hidden text-[11px] rounded-lg border border-[var(--pie-warn)]/50 bg-[var(--pie-warn)]/10 text-[var(--foreground)] px-3 py-2"></div>
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <span id="kernel-template-bytes" class="font-mono text-[10px] text-[var(--muted-foreground)]">--</span>
+          <div class="flex items-center gap-2">
+            <button id="kernel-clear-template-btn" onclick="clearKernelTemplateEditor()" class="px-2.5 py-1.5 text-[11px] rounded-lg border border-[var(--border)] bg-[var(--onyx-key)] hover:bg-[var(--card-hover)] text-[var(--foreground)] font-medium shadow-[var(--onyx-key-shadow)] transition active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed" disabled>清空编辑</button>
+            <button id="kernel-save-template-btn" onclick="saveKernelTemplate()" class="px-3 py-1.5 text-[11px] rounded-lg font-medium bg-[var(--primary)] text-[var(--primary-foreground)] shadow-sm hover:opacity-90 active:scale-95 transition disabled:opacity-40 disabled:cursor-not-allowed" disabled>保存提示词</button>
+          </div>
+        </div>
+        <div class="text-[11px] text-[var(--muted-foreground)] leading-relaxed bg-[var(--card-subtle)] border border-[var(--border)] rounded-lg px-3 py-2 space-y-1">
+          <div>· 自定义内容以纯文本写入：不允许包含 Go 模板指令 <span class="font-mono">{{ … }}</span>，含 <span class="font-mono">{{</span> 或 <span class="font-mono">}}</span> 的内容会被拒绝（防止客户端启动崩溃）。</div>
+          <div>· 原版模板内含 Go 指令：请直接替换为你自己的文本；需要原版内容时请使用下方「恢复」按钮。</div>
+          <div>· 身份 (identity) 等关键模板为只读，仅可查看，不可修改。</div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 pt-2 border-t border-[var(--border)]">
+          <button id="kernel-restore-prompts-btn" onclick="restoreKernelPrompts()" class="px-2.5 py-1.5 text-[11px] rounded-lg border border-[var(--border)] bg-[var(--onyx-key)] hover:bg-[var(--card-hover)] text-[var(--foreground)] font-medium shadow-[var(--onyx-key-shadow)] transition active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed" disabled>恢复全部提示词</button>
+          <button id="kernel-restore-all-btn" onclick="restoreKernelAll()" class="px-2.5 py-1.5 text-[11px] rounded-lg border border-[var(--pie-crit)]/50 bg-[var(--onyx-key)] hover:bg-[var(--card-hover)] text-[var(--foreground)] font-medium shadow-[var(--onyx-key-shadow)] transition active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed" disabled>恢复完整原始文件</button>
+          <span class="text-[10px] text-[var(--muted-foreground)]">恢复操作同样需要手动重启后生效</span>
+        </div>
+      </div>
+
+      <!-- Notices Card -->
+      <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-4 shadow-sm space-y-2">
+        <div class="text-xs font-semibold text-[var(--foreground)]">重要须知</div>
+        <ul class="text-[11px] text-[var(--muted-foreground)] leading-relaxed list-disc pl-4 space-y-1">
+          <li>支持与否完全取决于对本地文件的自动检测（二进制格式、架构与指令特征识别），不保证任何 Antigravity 版本都可修改；检测不通过时对应功能自动禁用，绝不会盲写文件。</li>
+          <li>macOS 上写入修改会替换可执行文件的原有签名（以 ad-hoc 方式对落盘文件重签），属预期行为。</li>
+          <li>Antigravity 应用更新后请重新扫描。若文件指纹与备份记录不符，修改和恢复都会被拒绝，避免覆盖新版内核。</li>
+          <li>所有写入磁盘的修改都需要手动重启 Antigravity 生效；本插件绝不会自动结束或重启任何进程。</li>
+          <li>首次修改前会自动保留原始文件备份（路径见上方「原始备份」），可随时恢复完整原始文件。</li>
+          <li>实现思路参考 <a class="underline" href="https://github.com/justhil/agy-tool" target="_blank" rel="noopener noreferrer">agy-tool</a>；本项目为独立实现，未复制其任何预设内容。</li>
+        </ul>
+      </div>
+
+    </div>
 
     <!-- ========================================== -->
     <!-- VIEW 2: GLOBAL METRICS & USAGE (Native AGY Style) -->
@@ -685,16 +826,21 @@
       currentMainView = view;
       document.getElementById('view-session').classList.toggle('hidden', view !== 'session');
       document.getElementById('view-global').classList.toggle('hidden', view !== 'global');
+      document.getElementById('view-kernel').classList.toggle('hidden', view !== 'kernel');
       document.getElementById('btn-view-session').classList.toggle('active', view === 'session');
       document.getElementById('btn-view-global').classList.toggle('active', view === 'global');
+      document.getElementById('btn-view-kernel').classList.toggle('active', view === 'kernel');
       
       const topTitle = document.getElementById('top-title');
       if (view === 'session') {
         if (topTitle) topTitle.textContent = '会话上下文';
         fetchSessionContext();
-      } else {
+      } else if (view === 'global') {
         if (topTitle) topTitle.textContent = '本地全局用量';
         fetchGlobalTokens();
+      } else {
+        if (topTitle) topTitle.textContent = '内核设置';
+        kernelSettingsEnter();
       }
     }
 
@@ -754,8 +900,10 @@
     function refreshCurrentView() {
       if (currentMainView === 'session') {
         fetchSessionContext();
-      } else {
+      } else if (currentMainView === 'global') {
         fetchGlobalTokens();
+      } else {
+        kernelSettingsEnter();
       }
     }
 
@@ -1449,6 +1597,543 @@
     }
 
     // ==========================================
+    // Kernel Settings: Context Unlock & Built-in Prompt Editor
+    // Shared API: GET /api/customization, POST /api/customization/inspect,
+    // POST /api/customization/apply (X-Context-Settings-Token + JSON).
+    // This view is never polled by the 10s timer; it only loads on explicit
+    // entry / refresh, and never applies anything automatically.
+    // ==========================================
+    const KERNEL_MODES = ['stock', '512k', '900k'];
+    // Display values used to compare the on-disk mode against live telemetry.
+    // 512k budget/display = 512000; 900k compression fallback = 900000,
+    // client displays ~983040.
+    const KERNEL_MODE_LIMITS = { '512k': 512000, '900k': 983040 };
+    const KERNEL_MODE_LABELS = { 'stock': '原生 (Stock)', '512k': '512K', '900k': '900K' };
+    const KERNEL_DRAFT_SEP = '\u0000';
+
+    const kernelState = {
+      targets: [],
+      token: '',
+      selectedTargetId: '',
+      inspection: null,
+      liveLimit: null,
+      restartPending: false,
+      busy: false,
+      selectedMode: null,
+      selectedTemplate: '',
+      drafts: {}
+    };
+
+    function kernelDraftKey(targetId, name) {
+      return targetId + KERNEL_DRAFT_SEP + name;
+    }
+
+    // sidecar.fetch authenticates natively; the plain-fetch fallback must carry
+    // the page's ?token= query parameter for the sidecar's own auth layer.
+    function kernelFetch(path, options) {
+      const useSdk = !!(window.sidecar && window.sidecar.fetch);
+      const fetchFn = useSdk ? window.sidecar.fetch : fetch;
+      let url = path;
+      if (!useSdk) {
+        const pageToken = new URLSearchParams(window.location.search).get('token');
+        if (pageToken) url += (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(pageToken);
+      }
+      return fetchFn(url, options);
+    }
+
+    function setKernelBusy(busy, label) {
+      kernelState.busy = busy;
+      const busyEl = document.getElementById('kernel-busy');
+      if (busyEl) {
+        busyEl.classList.toggle('hidden', !busy);
+        if (busy && label) busyEl.textContent = label;
+      }
+      const targetSel = document.getElementById('kernel-target-select');
+      if (targetSel) targetSel.disabled = busy;
+      updateKernelActionAvailability();
+    }
+
+    function updateKernelActionAvailability() {
+      const s = kernelState;
+      const insp = s.inspection;
+      const ctxOk = !!(insp && insp.context && insp.context.supported);
+      const tpl = currentKernelTemplate();
+      const editable = !!(tpl && tpl.editable);
+      const bytes = kernelEditorBytes();
+      const overCapacity = !!(tpl && typeof tpl.capacity === 'number' && tpl.capacity > 0 && bytes > tpl.capacity);
+      const dis = (id, cond) => { const el = document.getElementById(id); if (el) el.disabled = !!cond; };
+      dis('kernel-mode-stock', s.busy || !ctxOk);
+      dis('kernel-mode-512k', s.busy || !ctxOk);
+      dis('kernel-mode-900k', s.busy || !ctxOk);
+      dis('kernel-apply-context-btn', s.busy || !ctxOk);
+      dis('kernel-template-select', s.busy || !insp || !insp.templates || insp.templates.length === 0);
+      dis('kernel-template-editor', s.busy || !editable);
+      dis('kernel-save-template-btn', s.busy || !editable || overCapacity);
+      dis('kernel-clear-template-btn', s.busy || !editable);
+      dis('kernel-restore-prompts-btn', s.busy || !insp || !insp.backupAvailable);
+      dis('kernel-restore-all-btn', s.busy || !insp || !insp.backupAvailable);
+    }
+
+    function showKernelError(message) {
+      const el = document.getElementById('kernel-error');
+      if (!el) return;
+      el.textContent = message;
+      el.classList.remove('hidden');
+    }
+
+    function clearKernelError() {
+      const el = document.getElementById('kernel-error');
+      if (el) el.classList.add('hidden');
+    }
+
+    function showKernelMessage(message) {
+      const el = document.getElementById('kernel-message');
+      if (!el) return;
+      el.textContent = message;
+      el.classList.remove('hidden');
+    }
+
+    function clearKernelMessage() {
+      const el = document.getElementById('kernel-message');
+      if (el) el.classList.add('hidden');
+    }
+
+    async function kernelSettingsEnter() {
+      clearKernelError();
+      clearKernelMessage();
+      await loadKernelTargets();
+      fetchKernelLiveTelemetry();
+    }
+
+    async function loadKernelTargets() {
+      setKernelBusy(true, '正在获取目标列表...');
+      let data;
+      try {
+        const res = await kernelFetch('/api/customization');
+        if (!res.ok) throw new Error('API ' + res.status);
+        data = await res.json();
+      } catch (err) {
+        setKernelBusy(false);
+        showKernelError('获取目标列表失败: ' + (err && err.message ? err.message : err));
+        return;
+      }
+      kernelState.targets = (data && data.targets) || [];
+      kernelState.token = (data && data.token) || '';
+      const stillValid = kernelState.targets.some(t => t.id === kernelState.selectedTargetId && t.exists);
+      if (!stillValid) {
+        const firstExisting = kernelState.targets.find(t => t.exists);
+        kernelState.selectedTargetId = firstExisting ? firstExisting.id : (kernelState.targets[0] ? kernelState.targets[0].id : '');
+        kernelState.selectedTemplate = '';
+        kernelState.selectedMode = null;
+      }
+      renderKernelTargets();
+      setKernelBusy(false);
+      if (kernelState.selectedTargetId) {
+        await inspectKernelTarget(kernelState.selectedTargetId);
+      } else {
+        kernelState.inspection = null;
+        renderKernelInspection();
+        showKernelError('未检测到任何可用的目标程序，无法进行修改。');
+      }
+    }
+
+    function renderKernelTargets() {
+      const sel = document.getElementById('kernel-target-select');
+      if (!sel) return;
+      sel.innerHTML = '';
+      kernelState.targets.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t.id;
+        opt.textContent = t.label + (t.path ? ' — ' + t.path : '') + (t.exists ? '' : ' (未检测到)');
+        opt.disabled = !t.exists;
+        opt.selected = t.id === kernelState.selectedTargetId;
+        sel.appendChild(opt);
+      });
+    }
+
+    function onKernelTargetChange() {
+      if (kernelState.busy) return;
+      const sel = document.getElementById('kernel-target-select');
+      if (!sel || !sel.value) return;
+      kernelState.selectedTargetId = sel.value;
+      kernelState.selectedTemplate = '';
+      kernelState.selectedMode = null;
+      inspectKernelTarget(sel.value);
+    }
+
+    async function inspectKernelTarget(targetId) {
+      setKernelBusy(true, '正在检测目标文件...');
+      clearKernelError();
+      clearKernelMessage();
+      try {
+        const res = await kernelFetch('/api/customization/inspect', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Context-Settings-Token': kernelState.token || ''
+          },
+          body: JSON.stringify({ targetId })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || data.message || ('HTTP ' + res.status));
+        kernelState.inspection = data;
+        const templates = data.templates || [];
+        if (!templates.some(t => t.name === kernelState.selectedTemplate)) {
+          const firstEditable = templates.find(t => t.editable);
+          kernelState.selectedTemplate = firstEditable ? firstEditable.name : (templates[0] ? templates[0].name : '');
+        }
+        renderKernelInspection();
+      } catch (err) {
+        kernelState.inspection = null;
+        renderKernelInspection();
+        showKernelError('检测失败: ' + (err && err.message ? err.message : err));
+      } finally {
+        setKernelBusy(false);
+      }
+    }
+
+    function renderKernelInspection() {
+      const s = kernelState;
+      const insp = s.inspection;
+      const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+      const showRow = (id, show) => { const el = document.getElementById(id); if (el) el.classList.toggle('hidden', !show); };
+
+      setTxt('kernel-path', insp && insp.path ? insp.path : '--');
+      setTxt('kernel-hash', insp && insp.hash ? insp.hash : '--');
+      const hashEl = document.getElementById('kernel-hash');
+      if (hashEl) hashEl.title = (insp && insp.hash) || '';
+      setTxt('kernel-arch', insp ? `${insp.format || '--'} / ${insp.arch || '--'}` : '--');
+
+      const ctx = insp && insp.context ? insp.context : null;
+      const supported = !!(ctx && ctx.supported);
+      setTxt('kernel-context-supported', insp ? (supported ? '支持' : '不支持') : '--');
+      setTxt('kernel-context-mode', ctx && ctx.mode ? ctx.mode : '--');
+      setTxt('kernel-context-reason', (ctx && ctx.reason) || '--');
+      showRow('kernel-context-reason-row', !!(ctx && ctx.reason));
+
+      setTxt('kernel-backup-status', insp ? (insp.backupAvailable ? '可用' : '不可用') : '--');
+      setTxt('kernel-backup-path', (insp && insp.backupPath) || '--');
+      showRow('kernel-backup-path-row', !!(insp && insp.backupPath));
+
+      const warnEl = document.getElementById('kernel-warning');
+      if (warnEl) {
+        if (insp && insp.warning) {
+          warnEl.textContent = insp.warning;
+          warnEl.classList.remove('hidden');
+        } else {
+          warnEl.classList.add('hidden');
+        }
+      }
+
+      const gatesList = document.getElementById('kernel-gates-list');
+      if (gatesList) {
+        gatesList.innerHTML = '';
+        const gates = (ctx && ctx.gates) || [];
+        if (gates.length === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'text-[11px] text-[var(--muted-foreground)] font-mono';
+          empty.textContent = insp ? '未识别到上下文门控' : '--';
+          gatesList.appendChild(empty);
+        } else {
+          gates.forEach(g => {
+            const row = document.createElement('div');
+            row.className = 'flex items-center justify-between gap-2 text-[11px] font-mono bg-[var(--card-subtle)] border border-[var(--border)] rounded-lg px-2.5 py-1.5';
+            const idSpan = document.createElement('span');
+            idSpan.className = 'text-[var(--foreground)]';
+            idSpan.textContent = g.id || '--';
+            const modeSpan = document.createElement('span');
+            modeSpan.className = 'text-[var(--muted-foreground)]';
+            modeSpan.textContent = `${g.mode || '--'} @ 0x${(g.offset || 0).toString(16)}`;
+            row.appendChild(idSpan);
+            row.appendChild(modeSpan);
+            gatesList.appendChild(row);
+          });
+        }
+      }
+
+      renderKernelModeButtons();
+      renderKernelTemplateControls();
+      renderKernelRestartBanner();
+      updateKernelActionAvailability();
+    }
+
+    function setKernelMode(mode) {
+      if (kernelState.busy || KERNEL_MODES.indexOf(mode) < 0) return;
+      kernelState.selectedMode = mode;
+      renderKernelModeButtons();
+    }
+
+    function renderKernelModeButtons() {
+      const ctx = kernelState.inspection && kernelState.inspection.context;
+      if (kernelState.selectedMode === null || KERNEL_MODES.indexOf(kernelState.selectedMode) < 0) {
+        kernelState.selectedMode = (ctx && KERNEL_MODES.indexOf(ctx.mode) >= 0) ? ctx.mode : 'stock';
+      }
+      KERNEL_MODES.forEach(m => {
+        const btn = document.getElementById('kernel-mode-' + m);
+        if (btn) btn.classList.toggle('active', kernelState.selectedMode === m);
+      });
+    }
+
+    async function applyKernelContext() {
+      const s = kernelState;
+      if (s.busy || !s.inspection || !s.inspection.context || !s.inspection.context.supported) return;
+      await kernelApply({ contextMode: s.selectedMode });
+    }
+
+    async function kernelApply(payload, onSuccess) {
+      const s = kernelState;
+      if (s.busy || !s.inspection || !s.selectedTargetId) return;
+      setKernelBusy(true, '正在写入修改...');
+      clearKernelError();
+      clearKernelMessage();
+      try {
+        const body = {
+          targetId: s.selectedTargetId,
+          expectedHash: s.inspection.hash
+        };
+        Object.assign(body, payload || {});
+        const res = await kernelFetch('/api/customization/apply', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Context-Settings-Token': s.token || ''
+          },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || data.message || ('HTTP ' + res.status));
+        if (onSuccess) onSuccess();
+        s.inspection = data;
+        if (data.restartRequired) s.restartPending = true;
+        s.selectedMode = null; // re-sync the selector with the on-disk mode
+        renderKernelInspection();
+        showKernelMessage(data.message || '修改已写入磁盘。');
+        fetchKernelLiveTelemetry();
+      } catch (err) {
+        showKernelError('操作失败: ' + (err && err.message ? err.message : err));
+      } finally {
+        setKernelBusy(false);
+      }
+    }
+
+    function currentKernelTemplate() {
+      const insp = kernelState.inspection;
+      if (!insp || !insp.templates) return null;
+      return insp.templates.find(t => t.name === kernelState.selectedTemplate) || null;
+    }
+
+    function renderKernelTemplateControls() {
+      const s = kernelState;
+      const sel = document.getElementById('kernel-template-select');
+      if (!sel) return;
+      sel.innerHTML = '';
+      const templates = (s.inspection && s.inspection.templates) || [];
+      if (templates.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = s.inspection ? '未检测到内置提示词模板' : '尚未检测';
+        sel.appendChild(opt);
+        s.selectedTemplate = '';
+      } else {
+        if (!templates.some(t => t.name === s.selectedTemplate)) s.selectedTemplate = templates[0].name;
+        templates.forEach(t => {
+          const opt = document.createElement('option');
+          opt.value = t.name;
+          opt.textContent = t.name + (t.editable ? '' : ' (只读)');
+          opt.selected = t.name === s.selectedTemplate;
+          sel.appendChild(opt);
+        });
+      }
+      renderKernelEditorContent();
+    }
+
+    function renderKernelEditorContent() {
+      const s = kernelState;
+      const editor = document.getElementById('kernel-template-editor');
+      if (!editor) return;
+      const tpl = currentKernelTemplate();
+      const key = tpl ? kernelDraftKey(s.selectedTargetId, tpl.name) : '';
+      const hasDraft = !!(tpl && key in s.drafts);
+      editor.value = tpl ? (hasDraft ? s.drafts[key] : (tpl.content || '')) : '';
+      editor.readOnly = !(tpl && tpl.editable);
+      const metaEl = document.getElementById('kernel-template-meta');
+      if (metaEl) {
+        if (!tpl) {
+          metaEl.textContent = '--';
+        } else if (tpl.editable) {
+          metaEl.textContent = '可编辑 · 容量 ' + (typeof tpl.capacity === 'number' ? tpl.capacity.toLocaleString() : '--') + ' 字节';
+        } else {
+          metaEl.textContent = '只读 · 不可编辑';
+        }
+      }
+      updateKernelByteCounter();
+      renderKernelDirtyBanner();
+    }
+
+    const kernelEncoder = new TextEncoder();
+
+    function kernelEditorBytes() {
+      const editor = document.getElementById('kernel-template-editor');
+      if (!editor) return 0;
+      return kernelEncoder.encode(editor.value).length;
+    }
+
+    function updateKernelByteCounter() {
+      const tpl = currentKernelTemplate();
+      const el = document.getElementById('kernel-template-bytes');
+      if (!el) return;
+      const bytes = kernelEditorBytes();
+      const hasCap = !!(tpl && typeof tpl.capacity === 'number' && tpl.capacity > 0);
+      const over = hasCap && bytes > tpl.capacity;
+      el.textContent = hasCap
+        ? `${bytes.toLocaleString()} / ${tpl.capacity.toLocaleString()} 字节 (UTF-8)`
+        : `${bytes.toLocaleString()} 字节 (UTF-8)`;
+      el.className = 'font-mono text-[10px] ' + (over ? 'text-[var(--pie-crit)] font-semibold' : 'text-[var(--muted-foreground)]');
+    }
+
+    function onKernelTemplateChange() {
+      if (kernelState.busy) return;
+      const sel = document.getElementById('kernel-template-select');
+      if (!sel) return;
+      kernelState.selectedTemplate = sel.value;
+      renderKernelEditorContent();
+      updateKernelActionAvailability();
+    }
+
+    function onKernelEditorInput() {
+      const s = kernelState;
+      const tpl = currentKernelTemplate();
+      const editor = document.getElementById('kernel-template-editor');
+      if (!tpl || !tpl.editable || !editor) return;
+      s.drafts[kernelDraftKey(s.selectedTargetId, tpl.name)] = editor.value;
+      updateKernelByteCounter();
+      renderKernelDirtyBanner();
+      updateKernelActionAvailability();
+    }
+
+    function renderKernelDirtyBanner() {
+      const s = kernelState;
+      const banner = document.getElementById('kernel-editor-dirty');
+      if (!banner) return;
+      const tpl = currentKernelTemplate();
+      if (!tpl) {
+        banner.classList.add('hidden');
+        return;
+      }
+      const key = kernelDraftKey(s.selectedTargetId, tpl.name);
+      if (key in s.drafts && s.drafts[key] !== (tpl.content || '')) {
+        banner.textContent = '编辑器中有未保存的修改：切换模板或目标时草稿会自动保留（切回后恢复显示），但只有点击「保存提示词」才会写入磁盘。';
+        banner.classList.remove('hidden');
+      } else {
+        if (key in s.drafts) delete s.drafts[key];
+        banner.classList.add('hidden');
+      }
+    }
+
+    function clearKernelTemplateEditor() {
+      const s = kernelState;
+      if (s.busy) return;
+      const tpl = currentKernelTemplate();
+      const editor = document.getElementById('kernel-template-editor');
+      if (!tpl || !tpl.editable || !editor) return;
+      editor.value = '';
+      onKernelEditorInput();
+    }
+
+    async function saveKernelTemplate() {
+      const s = kernelState;
+      const tpl = currentKernelTemplate();
+      const editor = document.getElementById('kernel-template-editor');
+      if (s.busy || !tpl || !tpl.editable || !editor || !s.inspection) return;
+      const content = editor.value;
+      if (content.includes('{{') || content.includes('}}')) {
+        showKernelError('自定义提示词仅接受纯文本：请移除 Go 模板指令 {{ … }}；如需原版内容请使用「恢复全部提示词」。');
+        return;
+      }
+      const byteLen = kernelEncoder.encode(content).length;
+      if (typeof tpl.capacity === 'number' && tpl.capacity > 0 && byteLen > tpl.capacity) {
+        showKernelError(`内容 ${byteLen.toLocaleString()} 字节超出模板容量 ${tpl.capacity.toLocaleString()} 字节，无法保存。`);
+        return;
+      }
+      const templates = {};
+      templates[tpl.name] = content;
+      const name = tpl.name;
+      await kernelApply({ templates }, () => {
+        delete s.drafts[kernelDraftKey(s.selectedTargetId, name)];
+      });
+    }
+
+    async function restoreKernelPrompts() {
+      const s = kernelState;
+      if (s.busy || !s.inspection) return;
+      if (!window.confirm('确定要恢复全部内置提示词为原始内容吗？该目标的未保存草稿将被丢弃。')) return;
+      await kernelApply({ restorePrompts: true }, () => {
+        Object.keys(s.drafts).forEach(k => {
+          if (k.indexOf(s.selectedTargetId + KERNEL_DRAFT_SEP) === 0) delete s.drafts[k];
+        });
+      });
+    }
+
+    async function restoreKernelAll() {
+      const s = kernelState;
+      if (s.busy || !s.inspection) return;
+      if (!window.confirm('确定要将整个可执行文件恢复为原始备份吗？上下文解锁与提示词修改都会被撤销。')) return;
+      await kernelApply({ restoreAll: true }, () => {
+        s.restartPending = true;
+        Object.keys(s.drafts).forEach(k => {
+          if (k.indexOf(s.selectedTargetId + KERNEL_DRAFT_SEP) === 0) delete s.drafts[k];
+        });
+      });
+    }
+
+    async function fetchKernelLiveTelemetry() {
+      kernelState.liveLimit = null;
+      try {
+        let convId = '';
+        if (window.sidecar && window.sidecar.conversationId) {
+          convId = window.sidecar.conversationId;
+        } else {
+          convId = new URLSearchParams(window.location.search).get('conversationId') || '';
+        }
+        const res = await kernelFetch('/api/context?conversationId=' + encodeURIComponent(convId));
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.meta && data.meta.isOfficialTelemetry && typeof data.meta.modelLimit === 'number') {
+            kernelState.liveLimit = data.meta.modelLimit;
+          }
+        }
+      } catch (err) {
+        // telemetry unavailable: the banner falls back to restartPending state
+      }
+      renderKernelRestartBanner();
+    }
+
+    function renderKernelRestartBanner() {
+      const s = kernelState;
+      const banner = document.getElementById('kernel-restart-banner');
+      const detail = document.getElementById('kernel-restart-detail');
+      const liveEl = document.getElementById('kernel-context-live');
+      if (liveEl) {
+        liveEl.textContent = '当前会话官方遥测: ' + (s.liveLimit != null ? s.liveLimit.toLocaleString() + ' tokens' : '不可用');
+      }
+      if (!banner || !detail) return;
+      if (!s.inspection) {
+        banner.classList.add('hidden');
+        return;
+      }
+      const mode = s.inspection.context && s.inspection.context.mode;
+      const nominal = KERNEL_MODE_LIMITS[mode] || null;
+      if (s.restartPending) {
+        const diskTxt = (KERNEL_MODE_LABELS[mode] || mode || '--') + (nominal != null ? ` (~${nominal.toLocaleString()} tokens)` : '');
+        const liveTxt = s.liveLimit != null ? s.liveLimit.toLocaleString() + ' tokens' : '未知';
+        detail.textContent = `磁盘配置: ${diskTxt} · 当前会话遥测: ${liveTxt}。请手动重启 Antigravity 加载新配置；会话上限不能确认所选内核或提示词已经重新载入。`;
+        banner.classList.remove('hidden');
+      } else {
+        banner.classList.add('hidden');
+      }
+    }
+
+    // ==========================================
     // Update Checker & One-Click Upgrade Engine
     // ==========================================
     let cachedUpdateInfo = null;
@@ -1635,7 +2320,9 @@
       fetchSessionContext();
       fetchUpdateStatus(false);
       setInterval(() => {
-        refreshCurrentView();
+        // Never auto-poll the kernel settings view; it only loads on explicit
+        // user entry or an explicit refresh click.
+        if (currentMainView !== 'kernel') refreshCurrentView();
       }, 10000);
     });
   </script>
