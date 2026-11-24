@@ -9,21 +9,51 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { inspectBinary, patchBinary } from './binary-patcher.mjs';
 
-const checkpoint = 'google3/third_party/jetski/cortex/utils/utils.GetCheckpointConfig';
-const serializer = 'google3/third_party/oneharness/internal/core/serializers/serializers.DefaultSerializer.populateContextWindowMetadata';
-const prefix = 'google3/third_party/jetski/prompt/template_provider/templates/system_prompts/';
-const main = [0xb94057e3, 0xd29d0004, 0xf2a00064, 0x6b04007f, 0xd29d0004, 0xf2a00064, 0x9a843063, 0xb9005be3];
+const CHECKPOINT_SYM = 'google3/third_party/jetski/cortex/utils/utils.GetCheckpointConfig';
+const EXP_CHECKPOINT_SYM = 'google3/third_party/jetski/cortex/config/config.applyFeatureProviderCheckpointOverrideConfig';
+const SELECT_EXP_SYM = 'google3/third_party/jetski/cortex/config/config.selectCheckpointExperimentKey';
+const OFFERS_SYM = 'google3/third_party/jetski/cli/model/model.SelectorModel.offersContextWindow';
+const STORE_CW_SYM = 'google3/third_party/jetski/cli/store/store.(*Store).ContextWindow';
+const STORE_CHOICE_SYM = 'google3/third_party/jetski/cli/store/store.(*Store).ContextWindowChoice';
+const OVERRIDE_SYM = 'google3/third_party/jetski/cli/store/store.AutoCompactOverride';
+const PREFIX = 'google3/third_party/jetski/prompt/template_provider/templates/system_prompts/';
+
+// utils.GetCheckpointConfig 6-word arm64 clamp window (x3/w3 clamped against x4 = 256,000)
+const ARM64_CLAMP_WINDOW = [0xb94057e3, 0xd29d0004, 0xf2a00064, 0x6b04007f, 0xd29d0004, 0xf2a00064, 0x9a843063, 0xb9005be3];
+
 function putWords(buf, offset, values) {
   values.forEach((v, i) => buf.writeUInt32LE(v >>> 0, offset + i * 4));
 }
 
-// A small Mach-O/Go image with the actual instruction windows, including the
-// serializer's unreachable alignment word. No host binary is written by tests.
-export function binaryFixture() {
-  const buf = Buffer.alloc(0x6000);
+function writePclntab(buf, pcl, textVa, funcs, arch) {
+  buf.fill(0, pcl, pcl + 0x800);
+  Buffer.from(arch === 'arm64' ? 'f1ffffff00000408' : 'f1ffffff00000108', 'hex').copy(buf, pcl);
+  [funcs.length, 0, textVa, 72, 0, 0, 0, 0x400].forEach((n, i) => {
+    buf.writeBigUInt64LE(BigInt(n), pcl + 8 + i * 8);
+  });
+  let nameCursor = 0;
+  const table = pcl + 0x400;
+  const recBase = (funcs.length + 1) * 8;
+  funcs.forEach((fn, i) => {
+    const startPc = fn.startOff - 0x1000;
+    const funcoff = recBase + i * 8;
+    buf.writeUInt32LE(startPc, table + i * 8);
+    buf.writeUInt32LE(funcoff, table + i * 8 + 4);
+    buf.writeUInt32LE(startPc, table + funcoff);
+    buf.writeInt32LE(nameCursor, table + funcoff + 4);
+    buf.write(fn.name + '\0', pcl + 72 + nameCursor);
+    nameCursor += fn.name.length + 1;
+  });
+  const lastEndPc = funcs[funcs.length - 1].endOff - 0x1000;
+  buf.writeUInt32LE(lastEndPc, table + funcs.length * 8);
+  buf.writeUInt32LE(0, table + funcs.length * 8 + 4);
+}
+
+function writeMachoBase(funcs, arch = 'arm64') {
+  const buf = Buffer.alloc(0x8000);
   const va = 0x100000000;
   buf.writeUInt32LE(0xfeedfacf);
-  buf.writeUInt32LE(0x100000c, 4);
+  buf.writeUInt32LE(arch === 'arm64' ? 0x100000c : 0x1000007, 4);
   buf.writeUInt32LE(1, 16);
   buf.writeUInt32LE(152, 20);
   buf.writeUInt32LE(0x19, 32);
@@ -36,55 +66,181 @@ export function binaryFixture() {
   buf.writeUInt32LE(1, 96);
   buf.write('__text', 104);
   buf.writeBigUInt64LE(BigInt(va + 0x1000), 136);
-  putWords(buf, 0x1000, main);
-  putWords(buf, 0x1040, [0x7100007f, 0x5400008c, 0xd29d0003, 0xf2a00063, 0xb9000c03]);
-  putWords(buf, 0x1100, [0xf90043e0, 0xf940dfe1, 0xb9000001, 0xb27c07e0]);
-  // Unconditional branch back to function start, followed by 4 padding bytes.
-  putWords(buf, 0x11f8, [0x14000000 | ((-0xf8 / 4) & 0x3ffffff), 0]);
-  const pcl = 0x2000;
-  Buffer.from('f1ffffff00000408', 'hex').copy(buf, pcl);
-  [2, 0, 0, 72, 0, 0, 0, 0x400].forEach((n, i) => buf.writeBigUInt64LE(BigInt(n), pcl + 8 + i * 8));
-  buf.write(checkpoint + '\0' + serializer + '\0', pcl + 72);
-  putWords(buf, pcl + 0x400, [0, 0x40, 0x100, 0x60, 0x200, 0]);
-  putWords(buf, pcl + 0x440, [0, 0]);
-  putWords(buf, pcl + 0x460, [0x100, checkpoint.length + 1]);
+  writePclntab(buf, 0x2000, va + 0x1000, funcs, arch);
   const templates = ['identity.tmpl', 'guidelines.tmpl', 'function_call.tmpl'];
   templates.forEach((name, i) => {
     const nameOffset = 0x3000 + i * 256, data = 0x4000 + i * 256, entry = 0x3800 + i * 48;
-    buf.write(prefix + name, nameOffset);
+    buf.write(PREFIX + name, nameOffset);
     buf.fill(' ', data, data + 128);
     buf.write(`Original ${name}`, data);
-    [va + nameOffset, (prefix + name).length, va + data, 128].forEach((n, j) => buf.writeBigUInt64LE(BigInt(n), entry + j * 8));
+    [va + nameOffset, (PREFIX + name).length, va + data, 128].forEach((n, j) => buf.writeBigUInt64LE(BigInt(n), entry + j * 8));
   });
   return buf;
 }
 
-test('context mode changes all gates and restores exactly without altering prompts', () => {
-  const original = binaryFixture();
-  const before = inspectBinary(original);
-  assert.equal(before.context.mode, 'stock');
-  assert.equal(before.context.supported, true);
-  let changed = patchBinary(original, { contextMode: '512k' }, original);
-  assert.equal(inspectBinary(changed).context.mode, '512k');
-  assert.equal(changed.readUInt32LE(0x11fc), 512000);
-  assert.deepEqual(inspectBinary(changed).templates, before.templates);
-  changed = patchBinary(changed, { contextMode: '900k' }, original);
-  assert.equal(inspectBinary(changed).context.mode, '900k');
-  assert.equal(changed.readUInt32LE(0x11fc), 983040);
-  assert.equal(changed.readUInt32LE(0x1018), 0xd503201f);
-  assert.equal(changed.length, original.length);
-  assert.deepEqual(patchBinary(changed, { contextMode: 'stock' }, original), original);
+// A small Mach-O/Go server image with Gate 3A and Gate 3B windows. No host binary is written by tests.
+export function binaryFixture() {
+  const funcs = [
+    { name: CHECKPOINT_SYM, startOff: 0x1000, endOff: 0x1080 },
+    { name: EXP_CHECKPOINT_SYM, startOff: 0x1100, endOff: 0x1180 }
+  ];
+  const buf = writeMachoBase(funcs, 'arm64');
+  putWords(buf, 0x1000, ARM64_CLAMP_WINDOW);
+  // Gate 3B primary pattern: bl + cbz x1, +24 + 5 words + (ldr x1,[sp,#0x48]; mov x2,x0)
+  putWords(buf, 0x1110, [0x94000010, 0xb40000c1, 0xf9002be0, 0xaa0103e0, 0xaa0203e1, 0x97ffff00, 0xf9402be0, 0xf94027e1, 0xaa0003e2]);
+  return buf;
+}
+
+// A small Mach-O/Go agy CLI image with Gate 1, Rich Gate 2, Gate 3A, and Gate 3B.
+export function cliArm64Fixture() {
+  const funcs = [
+    { name: CHECKPOINT_SYM, startOff: 0x1000, endOff: 0x1080 },
+    { name: EXP_CHECKPOINT_SYM, startOff: 0x1100, endOff: 0x1180 },
+    { name: OVERRIDE_SYM, startOff: 0x1200, endOff: 0x1240 },
+    { name: STORE_CHOICE_SYM, startOff: 0x1240, endOff: 0x1280 },
+    { name: OFFERS_SYM, startOff: 0x1280, endOff: 0x12c0 },
+    { name: STORE_CW_SYM, startOff: 0x1300, endOff: 0x1500 }
+  ];
+  const buf = writeMachoBase(funcs, 'arm64');
+  putWords(buf, 0x1000, ARM64_CLAMP_WINDOW);
+  putWords(buf, 0x1110, [0x94000010, 0xb40000c1, 0xf9002be0, 0xaa0103e0, 0xaa0203e1, 0x97ffff00, 0xf9402be0, 0xf94027e1, 0xaa0003e2]);
+  putWords(buf, 0x1200, [0xd65f03c0]); // AutoCompactOverride
+  putWords(buf, 0x1240, [0xd65f03c0]); // ContextWindowChoice
+  putWords(buf, 0x1280, [0xf9400b90, 0xd10043f1, 0xeb10023f, 0xd65f03c0]); // offersContextWindow
+  // Store.ContextWindow (0x1300..0x1500): prologue save, Argon tbnz, bl AutoCompactOverride, cbnz -> epilogue
+  putWords(buf, 0x1300, [0xf9400b90, 0xeb3063ff, 0xf8180ffe, 0xf90047e0]); // +0x0c: str x0, [sp, #0x88]
+  putWords(buf, 0x1350, [0x92800000, 0xb7f801c0]); // +0x50: mov x0,#-1 ; +0x54: tbnz x0,#0x3f,...
+  const blDelta = (0x1200 - 0x1370) >> 2;
+  const blWord = (0x94000000 | (blDelta & 0x03ffffff)) >>> 0;
+  const cbnzWord = (0xb5000001 | (10 << 5)) >>> 0; // +0x74 -> +0x9c (10 words)
+  putWords(buf, 0x1370, [blWord, cbnzWord, 0xd503201f, 0xf94047e2, 0xf9405c42, 0xb4000162, 0xf9400441]);
+  putWords(buf, 0x139c, [0xf85f83fd, 0xf84807fe, 0xd65f03c0]); // epilogue: ldur x29 ; ldr x30 ; ret
+  return buf;
+}
+
+function peFromMacho(funcs, patches) {
+  const buf = writeMachoBase(funcs, 'x64');
+  buf.fill(0, 0, 0x1000);
+  buf.fill(0, 0x1000, 0x1800);
+  buf.write('MZ');
+  buf.writeUInt32LE(0x80, 0x3c);
+  buf.writeUInt32LE(0x4550, 0x80);
+  buf.writeUInt16LE(0x8664, 0x84);
+  buf.writeUInt16LE(1, 0x86);
+  buf.writeUInt16LE(0xf0, 0x94);
+  buf.writeUInt16LE(0x20b, 0x98);
+  buf.writeBigUInt64LE(0x100000000n, 0xb0);
+  buf.write('.text', 0x188);
+  buf.writeUInt32LE(0x7000, 0x190);
+  buf.writeUInt32LE(0x1000, 0x194);
+  buf.writeUInt32LE(0x7000, 0x198);
+  buf.writeUInt32LE(0x1000, 0x19c);
+  buf.writeUInt32LE(0x20000000, 0x1ac);
+  patches.forEach(([offset, bytes]) => Buffer.from(bytes, 'hex').copy(buf, offset));
+  return buf;
+}
+
+function peFixture() {
+  const funcs = [
+    { name: CHECKPOINT_SYM, startOff: 0x1000, endOff: 0x1080 },
+    { name: SELECT_EXP_SYM, startOff: 0x1080, endOff: 0x10c0 },
+    { name: EXP_CHECKPOINT_SYM, startOff: 0x1100, endOff: 0x1180 }
+  ];
+  const callDisp = Buffer.alloc(4);
+  callDisp.writeInt32LE(0x1080 - (0x1110 + 5), 0);
+  return peFromMacho(funcs, [
+    [0x1000, '8b54244c81fa00e80300be00e803000f42f289742450'],
+    [0x1080, 'c3'],
+    [0x1110, 'e8' + callDisp.toString('hex') + '4885c084c07512b801000000c3']
+  ]);
+}
+
+function peCliFixture() {
+  const funcs = [
+    { name: CHECKPOINT_SYM, startOff: 0x1000, endOff: 0x1080 },
+    { name: SELECT_EXP_SYM, startOff: 0x1080, endOff: 0x10c0 },
+    { name: EXP_CHECKPOINT_SYM, startOff: 0x1100, endOff: 0x1180 },
+    { name: OFFERS_SYM, startOff: 0x1200, endOff: 0x1240 },
+    { name: STORE_CHOICE_SYM, startOff: 0x1240, endOff: 0x1280 },
+    { name: STORE_CW_SYM, startOff: 0x1280, endOff: 0x1300 }
+  ];
+  const callDisp = Buffer.alloc(4);
+  callDisp.writeInt32LE(0x1080 - (0x1110 + 5), 0);
+  return peFromMacho(funcs, [
+    [0x1000, '8b54244c81fa00e80300be00e803000f42f289742450'],
+    [0x1080, 'c3'],
+    [0x1110, 'e8' + callDisp.toString('hex') + '4885c084c00f8520000000c3'],
+    [0x1200, '4883ec204889442410c3'],
+    [0x1240, 'b800000000c3'],
+    [0x1280, '4883ec384889442420c3']
+  ]);
+}
+
+test('context modes transition across stock/512k/900k/dynamic and restore byte-for-byte on all targets', () => {
+  const cases = [
+    { label: 'arm64 server', make: binaryFixture, kind: 'server', gates: ['gate3a', 'gate3b'] },
+    { label: 'arm64 cli', make: cliArm64Fixture, kind: 'cli', gates: ['gate1', 'gate2-whitelist', 'gate2-tail', 'gate3a', 'gate3b'] },
+    { label: 'x64 server', make: peFixture, kind: 'server', gates: ['gate3a', 'gate3b'] },
+    { label: 'x64 cli', make: peCliFixture, kind: 'cli', gates: ['gate1', 'gate2', 'gate3a', 'gate3b'] }
+  ];
+  for (const tc of cases) {
+    const original = tc.make();
+    const before = inspectBinary(original);
+    assert.equal(before.context.supported, true, tc.label);
+    assert.equal(before.context.targetKind, tc.kind, tc.label);
+    assert.equal(before.context.mode, 'stock', tc.label);
+    assert.deepEqual(before.context.gates.map(g => g.id), tc.gates, tc.label);
+
+    let current = original;
+    for (const mode of ['512k', '900k', 'dynamic', '512k']) {
+      current = patchBinary(current, { contextMode: mode }, original);
+      const state = inspectBinary(current);
+      assert.equal(state.context.supported, true, `${tc.label} -> ${mode}`);
+      assert.equal(state.context.mode, mode, `${tc.label} -> ${mode}`);
+      assert.deepEqual(state.templates, before.templates, `${tc.label} templates preserved`);
+      assert.equal(current.length, original.length);
+    }
+    const restored = patchBinary(current, { contextMode: 'stock' }, original);
+    assert.equal(restored.equals(original), true, `${tc.label} byte-exact stock restore`);
+  }
+});
+
+test('arm64 fallback Gate 3B and entry-jump Gate 2 work cleanly', () => {
+  const funcs = [
+    { name: CHECKPOINT_SYM, startOff: 0x1000, endOff: 0x1080 },
+    { name: SELECT_EXP_SYM, startOff: 0x1080, endOff: 0x10c0 },
+    { name: EXP_CHECKPOINT_SYM, startOff: 0x1100, endOff: 0x1180 },
+    { name: STORE_CHOICE_SYM, startOff: 0x1240, endOff: 0x1280 },
+    { name: OFFERS_SYM, startOff: 0x1280, endOff: 0x12c0 },
+    { name: STORE_CW_SYM, startOff: 0x1300, endOff: 0x1340 } // < 0x100 triggers clean entry-jump fallback
+  ];
+  const buf = writeMachoBase(funcs, 'arm64');
+  putWords(buf, 0x1000, ARM64_CLAMP_WINDOW);
+  putWords(buf, 0x1080, [0xd65f03c0]);
+  const blSel = (0x94000000 | (((0x1080 - 0x1110) >> 2) & 0x03ffffff)) >>> 0;
+  // bl selectCheckpointExperimentKey ; blr x6 ; tbnz w0,#0,+0xc
+  putWords(buf, 0x1110, [blSel, 0xd63f00c0, 0x37000060, 0xd65f03c0]);
+  putWords(buf, 0x1240, [0xd65f03c0]);
+  putWords(buf, 0x1280, [0xf9400b90, 0xd10043f1, 0xeb10023f, 0xd65f03c0]);
+  putWords(buf, 0x1300, [0xf9400b90, 0xd10043f1, 0xeb10023f, 0xd65f03c0]);
+
+  const patched = patchBinary(buf, { contextMode: 'dynamic' }, buf);
+  const info = inspectBinary(patched);
+  assert.equal(info.context.supported, true);
+  assert.equal(info.context.mode, 'dynamic');
+  assert.deepEqual(info.context.gates.map(g => g.id), ['gate1', 'gate2', 'gate3a', 'gate3b']);
+  assert.equal(patchBinary(patched, { contextMode: 'stock' }, buf).equals(buf), true);
 });
 
 test('prompt edits preserve other prompts and context; independent restore works', () => {
   const original = binaryFixture();
-  const context = patchBinary(original, { contextMode: '900k' }, original);
+  const context = patchBinary(original, { contextMode: 'dynamic' }, original);
   let changed = patchBinary(context, { templates: { 'guidelines.tmpl': '先读取文件，再修改。' } }, original);
   changed = patchBinary(changed, { templates: { 'function_call.tmpl': '' } }, original);
   const state = inspectBinary(changed);
   assert.equal(state.templates.find(s => s.name === 'guidelines.tmpl').content, '先读取文件，再修改。');
   assert.equal(state.templates.find(s => s.name === 'function_call.tmpl').content, '');
-  assert.equal(state.context.mode, '900k');
+  assert.equal(state.context.mode, 'dynamic');
   assert.deepEqual(patchBinary(changed, { restorePrompts: true }, original), context);
   assert.deepEqual(patchBinary(changed, { restoreAll: true }, original), original);
 });
@@ -101,15 +257,39 @@ test('invalid template edits fail before any bytes change', () => {
   }
 });
 
-test('missing or ambiguous instruction windows never produce a partial context unlock', () => {
-  for (const damage of ['missing', 'duplicate', 'cave']) {
-    const original = binaryFixture();
-    if (damage === 'missing') original.writeUInt32LE(0, 0x1040);
-    if (damage === 'duplicate') putWords(original, 0x1080, main);
-    if (damage === 'cave') original.writeUInt32LE(1, 0x11fc);
-    assert.equal(inspectBinary(original).context.supported, false);
-    assert.throws(() => patchBinary(original, { contextMode: '512k' }, original));
-  }
+test('missing, ambiguous, inconsistent, or non-stock baselines fail closed', () => {
+  // Missing Gate 3B
+  const missing3b = binaryFixture();
+  missing3b.writeUInt32LE(0, 0x1114);
+  assert.equal(inspectBinary(missing3b).context.supported, false);
+  assert.throws(() => patchBinary(missing3b, { contextMode: '512k' }, missing3b));
+
+  // Duplicate Gate 3A
+  const dup3a = binaryFixture();
+  putWords(dup3a, 0x1040, ARM64_CLAMP_WINDOW);
+  assert.equal(inspectBinary(dup3a).context.supported, false);
+  assert.throws(() => patchBinary(dup3a, { contextMode: '512k' }, dup3a));
+
+  // Mixed / inconsistent gate states (Gate 3A unlocked to 512k while Gate 3B remains stock)
+  const mixed = binaryFixture();
+  const patched512 = patchBinary(mixed, { contextMode: '512k' }, mixed);
+  const g3bOffset = inspectBinary(mixed).context.gates.find(g => g.id === 'gate3b').offset;
+  mixed.subarray(g3bOffset, g3bOffset + 24).copy(patched512, g3bOffset);
+  const mixedInfo = inspectBinary(patched512);
+  assert.equal(mixedInfo.context.supported, false);
+  assert.equal(mixedInfo.context.mode, 'unknown');
+  assert.throws(() => patchBinary(patched512, { contextMode: '900k' }, mixed));
+
+  // Missing CLI companion symbol (offersContextWindow present, Store.ContextWindowChoice absent)
+  const brokenCli = cliArm64Fixture();
+  const choiceIdx = brokenCli.indexOf(Buffer.from(STORE_CHOICE_SYM + '\0'));
+  brokenCli.write('X', choiceIdx + STORE_CHOICE_SYM.length - 1);
+  assert.equal(inspectBinary(brokenCli).context.supported, false);
+  assert.throws(() => patchBinary(brokenCli, { contextMode: '512k' }, brokenCli));
+
+  // Calling contextMode: 'stock' without a stock baseline
+  const baseline512 = patchBinary(binaryFixture(), { contextMode: '512k' }, binaryFixture());
+  assert.throws(() => patchBinary(baseline512, { contextMode: 'stock' }, baseline512), /原生备份/);
 });
 
 test('unknown headers and unmapped template pointers are rejected', () => {
@@ -131,52 +311,11 @@ test('embedded Go metadata outside the designated Mach-O section is ignored', ()
   buf.writeUInt32LE(2, 96);
   buf.write('__lrodata_gopcln', 184);
   buf.writeUInt32LE(0x2000, 232);
-  buf.copy(buf, 0x5000, 0x2000, 0x2500);
+  buf.copy(buf, 0x5000, 0x2000, 0x2800);
   assert.equal(inspectBinary(buf).context.mode, 'stock');
 });
 
-function peFixture() {
-  const buf = binaryFixture();
-  buf.fill(0, 0, 0x1000);
-  buf.write('MZ');
-  buf.writeUInt32LE(0x80, 0x3c);
-  buf.writeUInt32LE(0x4550, 0x80);
-  buf.writeUInt16LE(0x8664, 0x84);
-  buf.writeUInt16LE(1, 0x86);
-  buf.writeUInt16LE(0xf0, 0x94);
-  buf.writeUInt16LE(0x20b, 0x98);
-  buf.writeBigUInt64LE(0x100000000n, 0xb0);
-  buf.write('.text', 0x188);
-  buf.writeUInt32LE(0x5000, 0x190);
-  buf.writeUInt32LE(0x1000, 0x194);
-  buf.writeUInt32LE(0x5000, 0x198);
-  buf.writeUInt32LE(0x1000, 0x19c);
-  buf.writeUInt32LE(0x20000000, 0x1ac);
-  buf[0x2006] = 1;
-  buf.writeBigUInt64LE(0x100001000n, 0x2018);
-  buf.fill(0, 0x1000, 0x1200);
-  const patterns = [
-    [0x1000, '8b54244c81fa00e80300be00e803000f42f289742450'],
-    [0x1040, '837a14007f07c7400c00e80300'],
-    [0x1100, '4889442470488b8c24a80100008908b830000000']
-  ];
-  patterns.forEach(([offset, bytes]) => Buffer.from(bytes, 'hex').copy(buf, offset));
-  return buf;
-}
-
-test('PE64 reference patches switch both compression paths and the display limit', () => {
-  const buf = peFixture();
-  assert.equal(inspectBinary(buf).context.mode, 'stock');
-  let patched = patchBinary(buf, { contextMode: '512k' }, buf);
-  assert.equal(inspectBinary(patched).context.mode, '512k');
-  assert.equal(patched.readUInt32LE(0x1000 + 6), 512000);
-  patched = patchBinary(patched, { contextMode: '900k' }, buf);
-  assert.equal(inspectBinary(patched).context.mode, '900k');
-  assert.equal(patched.readUInt32LE(0x1100 + 7), 983040);
-  assert.deepEqual(patchBinary(patched, { contextMode: 'stock' }, buf), buf);
-});
-
-test('HTTP settings apply, independent restore, conflicts and validation preserve user files', { timeout: 30000 }, async () => {
+test('HTTP settings apply (including dynamic), independent restore, conflicts and validation preserve user files', { timeout: 30000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-context-api-'));
   const binary = path.join(dir, 'language_server.exe');
   const configDir = path.join(dir, 'config');
@@ -286,8 +425,11 @@ test('HTTP settings apply, independent restore, conflicts and validation preserv
     assert.ok(malformed.status >= 400);
     assert.deepEqual(fs.readFileSync(binary), beforeInvalid);
     fs.writeFileSync(configPath, JSON.stringify({ contextWindow: '512K', unrelated: 'newer user setting' }));
+    state = (await post('apply', { expectedHash: state.hash, contextMode: 'dynamic' })).data;
+    assert.equal(state.context.mode, 'dynamic');
+    assert.equal(JSON.parse(fs.readFileSync(configPath)).contextWindow, '');
     state = (await post('apply', { expectedHash: state.hash, restorePrompts: true })).data;
-    assert.equal(state.context.mode, '512k');
+    assert.equal(state.context.mode, 'dynamic');
     assert.equal(state.templates.find(s => s.name === 'guidelines.tmpl').content, inspectBinary(original).templates.find(s => s.name === 'guidelines.tmpl').content);
     state = (await post('apply', { expectedHash: state.hash, restoreAll: true })).data;
     assert.equal(state.context.mode, 'stock');
@@ -297,9 +439,30 @@ test('HTTP settings apply, independent restore, conflicts and validation preserv
     altered[altered.length - 1] = 1;
     fs.writeFileSync(binary, altered);
     const externallyChanged = (await post('inspect', {})).data;
-    const rejected = await post('apply', { expectedHash: externallyChanged.hash, restoreAll: true });
-    assert.equal(rejected.status, 409);
+    assert.equal(externallyChanged.staleBackup, true);
+    assert.equal(externallyChanged.canAutoRebaseline, true);
+    assert.equal(externallyChanged.backupAvailable, false);
+    assert.equal((await post('apply', { expectedHash: externallyChanged.hash, restoreAll: true })).status, 409);
+    assert.equal((await post('apply', { expectedHash: externallyChanged.hash, restorePrompts: true })).status, 409);
     assert.deepEqual(fs.readFileSync(binary), altered);
+    // Silent auto-rebaseline: applying forward change directly on updated stock binary succeeds and records new baseline
+    const autoRebaselined = await post('apply', { expectedHash: externallyChanged.hash, contextMode: '900k' });
+    assert.equal(autoRebaselined.status, 200, JSON.stringify(autoRebaselined.data));
+    assert.equal(autoRebaselined.data.context.mode, '900k');
+    assert.equal(autoRebaselined.data.backupAvailable, true);
+    assert.equal(autoRebaselined.data.staleBackup, undefined);
+    // Restoring after auto-rebaseline restores the new version's baseline (`altered`), not `original`
+    const restoredNew = await post('apply', { expectedHash: autoRebaselined.data.hash, restoreAll: true });
+    assert.equal(restoredNew.status, 200, JSON.stringify(restoredNew.data));
+    assert.deepEqual(fs.readFileSync(binary), altered);
+    // External modification into a non-stock state still refuses to overwrite existing backup
+    state = (await post('apply', { expectedHash: restoredNew.data.hash, contextMode: '900k' })).data;
+    const nonStockExternal = patchBinary(altered, { contextMode: '512k' }, altered);
+    fs.writeFileSync(binary, nonStockExternal);
+    const nonStockInspect = (await post('inspect', {})).data;
+    assert.equal(nonStockInspect.staleBackup, true);
+    assert.equal(nonStockInspect.canAutoRebaseline, false);
+    assert.equal((await post('apply', { expectedHash: nonStockInspect.hash, contextMode: '900k' })).status, 409);
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill();

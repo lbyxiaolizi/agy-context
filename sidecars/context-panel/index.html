@@ -416,6 +416,9 @@
                 <span class="w-2.5 h-0.5 bg-[var(--foreground)] inline-block"></span> 上下文总量
               </span>
               <span class="flex items-center gap-1">
+                <span class="w-2.5 h-0 border-t-[1.5px] border-dashed border-[#16a34a] inline-block"></span> 缓存命中率 (%)
+              </span>
+              <span class="flex items-center gap-1">
                 <span class="w-1.5 h-1.5 rounded-full bg-[#16a34a] inline-block"></span> 峰值 / 最新
               </span>
             </div>
@@ -442,6 +445,10 @@
                 <span id="tt-cache" class="font-mono text-[var(--muted-foreground)]">--</span>
               </div>
               <div class="flex justify-between items-center text-[11px]">
+                <span class="text-[var(--muted-foreground)]">缓存命中率:</span>
+                <span id="tt-cache-ratio" class="font-mono font-semibold text-[var(--foreground)]">--%</span>
+              </div>
+              <div class="flex justify-between items-center text-[11px]">
                 <span class="text-[var(--muted-foreground)]">单轮未缓存:</span>
                 <span id="tt-input" class="font-mono text-[var(--muted-foreground)]">--</span>
               </div>
@@ -457,7 +464,33 @@
           </div>
 
           <div class="flex items-center justify-end text-[11px] text-[var(--muted-foreground)] px-1">
-            <span class="font-mono">纵轴：Tokens (单位 K/M) | 横轴：交互轮次</span>
+            <span class="font-mono">左纵轴：Tokens (K/M) | 右纵轴：缓存命中率 (%) | 横轴：交互轮次</span>
+          </div>
+        </div>
+
+        <!-- Per-Turn Cache Hit Ratio Log Card -->
+        <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-3.5 sm:p-4 shadow-sm space-y-2.5">
+          <div class="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-[var(--border)]">
+            <span class="text-xs font-semibold text-[var(--foreground)]">每轮缓存命中记录</span>
+            <span id="tl-avg-cache-badge" class="px-1.5 py-0.5 rounded text-[10px] font-mono border border-[var(--border)] bg-[var(--card-subtle)] text-[var(--muted-foreground)]">累计命中率 --%</span>
+          </div>
+          <div class="max-h-56 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--card-subtle)]">
+            <table class="w-full text-left border-collapse text-[11px] font-mono">
+              <thead class="sticky top-0 z-10 bg-[var(--card)] border-b border-[var(--border)] text-[10px] text-[var(--muted-foreground)]">
+                <tr>
+                  <th class="px-2.5 py-1.5 font-medium">轮次</th>
+                  <th class="px-2.5 py-1.5 font-medium text-right">上下文</th>
+                  <th class="px-2.5 py-1.5 font-medium text-right">缓存读取</th>
+                  <th class="px-2.5 py-1.5 font-medium text-right">未缓存</th>
+                  <th class="px-2.5 py-1.5 font-medium text-right">命中率</th>
+                </tr>
+              </thead>
+              <tbody id="tl-cache-table-body" class="divide-y divide-[var(--border-subtle)]">
+                <tr>
+                  <td colspan="5" class="px-3 py-4 text-center text-[var(--muted-foreground)]">暂无每轮缓存记录</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
@@ -496,6 +529,13 @@
         <div id="kernel-message" class="hidden text-xs rounded-lg border border-[var(--primary)]/40 bg-[var(--primary)]/10 text-[var(--foreground)] px-3 py-2"></div>
         <div id="kernel-error" class="hidden text-xs rounded-lg border border-[var(--pie-crit)]/50 bg-[var(--pie-crit)]/10 text-[var(--foreground)] px-3 py-2"></div>
         <div id="kernel-warning" class="hidden text-[11px] rounded-lg border border-[var(--pie-warn)]/50 bg-[var(--pie-warn)]/10 text-[var(--foreground)] px-3 py-2"></div>
+        <div id="kernel-confirm-bar" class="hidden flex flex-wrap items-center justify-between gap-2 text-xs rounded-lg border border-[var(--pie-crit)]/50 bg-[var(--pie-crit)]/10 text-[var(--foreground)] px-3 py-2">
+          <span id="kernel-confirm-text">--</span>
+          <div class="flex items-center gap-2">
+            <button id="kernel-confirm-cancel-btn" type="button" onclick="cancelKernelConfirm()" class="px-2.5 py-1 rounded-md text-[11px] border border-[var(--border)] bg-[var(--onyx-key)] hover:bg-[var(--card-hover)] text-[var(--foreground)]">取消</button>
+            <button id="kernel-confirm-ok-btn" type="button" onclick="acceptKernelConfirm()" class="px-2.5 py-1 rounded-md text-[11px] font-medium bg-[var(--primary)] text-[var(--primary-foreground)] hover:opacity-90">确认执行</button>
+          </div>
+        </div>
 
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
           <div class="bg-[var(--card-subtle)] p-2.5 rounded-lg border border-[var(--border)] space-y-1">
@@ -553,15 +593,17 @@
           <div class="text-xs font-semibold text-[var(--foreground)]">上下文窗口解锁 (Context Unlock)</div>
           <div class="text-[10px] text-[var(--muted-foreground)]">与下方提示词编辑相互独立，需分别显式应用，切换选项不会自动写入</div>
         </div>
-        <div class="inline-flex items-center space-x-1 bg-[var(--onyx-well)] p-1 rounded-lg border border-[var(--border-subtle)]">
+        <div class="inline-flex flex-wrap items-center gap-1 bg-[var(--onyx-well)] p-1 rounded-lg border border-[var(--border-subtle)]">
           <button type="button" id="kernel-mode-stock" onclick="setKernelMode('stock')" class="range-btn px-3 py-1 rounded-md text-[11px]" disabled>原生 (Stock)</button>
           <button type="button" id="kernel-mode-512k" onclick="setKernelMode('512k')" class="range-btn px-3 py-1 rounded-md text-[11px]" disabled>512K</button>
           <button type="button" id="kernel-mode-900k" onclick="setKernelMode('900k')" class="range-btn px-3 py-1 rounded-md text-[11px]" disabled>900K</button>
+          <button type="button" id="kernel-mode-dynamic" onclick="setKernelMode('dynamic')" class="range-btn px-3 py-1 rounded-md text-[11px]" disabled>动态上限 (Dynamic)</button>
         </div>
         <div class="text-[11px] text-[var(--muted-foreground)] leading-relaxed bg-[var(--card-subtle)] border border-[var(--border)] rounded-lg px-3 py-2 space-y-1">
-          <div>· 512K 模式：压缩回退预算与显示上限均为 <span class="font-mono">512,000</span> tokens。</div>
+          <div>· 512K 模式：压缩回退预算设为 <span class="font-mono">512,000</span> tokens；在 <span class="font-mono">agy</span> CLI 中同步解锁 <span class="font-mono">/model</span> 档位切换。</div>
           <div>· 900K 模式：压缩回退预算设为 <span class="font-mono">900,000</span> tokens，客户端界面显示约 <span class="font-mono">983,040</span>。</div>
-          <div>· 服务端模型自身的真实限额不会被修改：超出所选模型服务端上限的请求仍可能被拒绝或截断。</div>
+          <div>· 动态上限 (Dynamic)：移除客户端 256K 硬钳制，释放模型完整物理预算（如 1M 模型约 <span class="font-mono">983,040</span> tokens）；在 <span class="font-mono">agy</span> CLI 中对应 <span class="font-mono">Default</span> 档位。</div>
+          <div>· 已包含防实验开关回退保护（阻止实验 Checkpointer 重置为 256K）；服务端模型自身的真实限额不会被修改。</div>
         </div>
         <div class="flex flex-wrap items-center justify-between gap-2">
           <span id="kernel-context-live" class="text-[10px] font-mono text-[var(--muted-foreground)]">运行遥测: --</span>
@@ -605,11 +647,11 @@
         <div class="text-xs font-semibold text-[var(--foreground)]">重要须知</div>
         <ul class="text-[11px] text-[var(--muted-foreground)] leading-relaxed list-disc pl-4 space-y-1">
           <li>支持与否完全取决于对本地文件的自动检测（二进制格式、架构与指令特征识别），不保证任何 Antigravity 版本都可修改；检测不通过时对应功能自动禁用，绝不会盲写文件。</li>
-          <li>macOS 上写入修改会替换可执行文件的原有签名（以 ad-hoc 方式对落盘文件重签），属预期行为。</li>
+          <li>macOS 上写入修改会以 ad-hoc 方式对落盘文件重签（保留原 Identifier、Hardened Runtime 及 ad-hoc 安全 entitlements）；恢复完整原始文件时还原官方签名。</li>
           <li>Antigravity 应用更新后请重新扫描。若文件指纹与备份记录不符，修改和恢复都会被拒绝，避免覆盖新版内核。</li>
           <li>所有写入磁盘的修改都需要手动重启 Antigravity 生效；本插件绝不会自动结束或重启任何进程。</li>
           <li>首次修改前会自动保留原始文件备份（路径见上方「原始备份」），可随时恢复完整原始文件。</li>
-          <li>实现思路参考 <a class="underline" href="https://github.com/justhil/agy-tool" target="_blank" rel="noopener noreferrer">agy-tool</a>；本项目为独立实现，未复制其任何预设内容。</li>
+          <li>实现思路参考 <a class="underline" href="https://github.com/justhil/agy-tool" target="_blank" rel="noopener noreferrer">agy-tool</a> 与上游 <a class="underline" href="https://github.com/q1uuuu/agy-context" target="_blank" rel="noopener noreferrer">agy-context</a>；本项目以纯 Node.js 独立实现，未复制其任何预设内容。</li>
         </ul>
       </div>
 
@@ -853,7 +895,7 @@
       document.getElementById(`subtab-${tab}`).classList.remove('hidden');
       document.getElementById(`subtab-btn-${tab}`).classList.add('active');
       if (tab === 'timeline' && sessionDataCache && sessionDataCache.timeline) {
-        renderSessionTimelineChart(sessionDataCache.timeline);
+        renderSessionTimelineChart(sessionDataCache.timeline, sessionDataCache.overview || null);
       }
     }
 
@@ -1339,7 +1381,7 @@
       }
 
       // Timeline chart
-      renderSessionTimelineChart(data.timeline || []);
+      renderSessionTimelineChart(data.timeline || [], data.overview || null);
 
       // Advice
       const aList = document.getElementById('session-advice-list');
@@ -1363,14 +1405,20 @@
       return n.toString();
     }
 
-    function renderSessionTimelineChart(timeline) {
+    function getTurnCacheRatio(p) {
+      if (typeof p.cache_hit_ratio === 'number') return p.cache_hit_ratio;
+      return p.total_context > 0 ? Number((((p.cache_tokens || 0) / p.total_context) * 100).toFixed(1)) : 0;
+    }
+
+    function renderSessionTimelineChart(timeline, overview = null) {
       const svg = document.getElementById('session-evolution-chart');
       const tooltip = document.getElementById('tl-chart-tooltip');
+      const tableBody = document.getElementById('tl-cache-table-body');
+      const setTxt = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
       if (!svg) return;
 
       if (!timeline || timeline.length === 0) {
         svg.innerHTML = '<text x="50%" y="50%" fill="currentColor" font-size="11" text-anchor="middle" class="text-[var(--muted-foreground)]">暂无历史轨迹数据</text>';
-        const setTxt = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
         setTxt('tl-stat-init', '--');
         setTxt('tl-stat-curr', '--');
         setTxt('tl-stat-curr-sub', '第 -- 轮');
@@ -1378,6 +1426,10 @@
         setTxt('tl-stat-peak-sub', '第 -- 轮');
         setTxt('tl-stat-rate', '--');
         setTxt('tl-turns-badge', '0 轮数据');
+        setTxt('tl-avg-cache-badge', '累计命中率 --%');
+        if (tableBody) {
+          tableBody.innerHTML = '<tr><td colspan="5" class="px-3 py-4 text-center text-[var(--muted-foreground)]">暂无每轮缓存记录</td></tr>';
+        }
         return;
       }
 
@@ -1388,7 +1440,6 @@
       const avgGrowth = Math.round((lastPt.total_context - firstPt.total_context) / Math.max(1, points.length - 1));
 
       // Update KPI summary cards
-      const setTxt = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
       setTxt('tl-stat-init', firstPt.total_context.toLocaleString());
       setTxt('tl-stat-curr', lastPt.total_context.toLocaleString());
       setTxt('tl-stat-curr-sub', `第 ${lastPt.turn} 轮`);
@@ -1397,11 +1448,50 @@
       setTxt('tl-stat-rate', `${avgGrowth >= 0 ? '+' : ''}${avgGrowth.toLocaleString()} / 轮`);
       setTxt('tl-turns-badge', `共 ${points.length} 轮数据`);
 
+      let avgCacheRatio = (overview && typeof overview.avgCacheHitRatio === 'number') ? overview.avgCacheHitRatio : null;
+      if (avgCacheRatio === null) {
+        const sumCache = points.reduce((acc, p) => acc + (p.cache_tokens || 0), 0);
+        const sumWin = points.reduce((acc, p) => acc + (p.input_tokens || 0) + (p.cache_tokens || 0), 0);
+        avgCacheRatio = sumWin > 0 ? Number(((sumCache / sumWin) * 100).toFixed(1)) : 0;
+      }
+      setTxt('tl-avg-cache-badge', `累计命中率 ${avgCacheRatio.toFixed(1)}%`);
+
+      if (tableBody) {
+        const rows = [];
+        for (let i = points.length - 1; i >= 0; i--) {
+          const p = points[i];
+          const turnNum = Number(p.turn) || (i + 1);
+          const totalCtx = Number(p.total_context || 0);
+          const cacheTok = Number(p.cache_tokens || 0);
+          const inputTok = Number(p.input_tokens || 0);
+          const ratio = Math.max(0, Math.min(100, getTurnCacheRatio(p)));
+          const colorCls = ratio >= 70 ? 'text-[#16a34a]' : (ratio >= 40 ? 'text-[#d97706]' : 'text-[#dc2626]');
+          const barBg = ratio >= 70 ? 'bg-[#16a34a]' : (ratio >= 40 ? 'bg-[#d97706]' : 'bg-[#dc2626]');
+          rows.push(`
+            <tr class="hover:bg-[var(--card-hover)] transition-colors">
+              <td class="px-2.5 py-1.5 text-[var(--foreground)] font-semibold">T${turnNum}</td>
+              <td class="px-2.5 py-1.5 text-right text-[var(--foreground)]">${totalCtx.toLocaleString()}</td>
+              <td class="px-2.5 py-1.5 text-right text-[var(--muted-foreground)]">${cacheTok.toLocaleString()}</td>
+              <td class="px-2.5 py-1.5 text-right text-[var(--muted-foreground)]">${inputTok.toLocaleString()}</td>
+              <td class="px-2.5 py-1.5 text-right">
+                <span class="inline-flex items-center justify-end gap-1.5">
+                  <span class="w-8 h-1 rounded-full bg-[var(--onyx-well)] overflow-hidden inline-block">
+                    <span class="block h-full ${barBg}" style="width: ${ratio.toFixed(1)}%"></span>
+                  </span>
+                  <span class="font-semibold ${colorCls}">${ratio.toFixed(1)}%</span>
+                </span>
+              </td>
+            </tr>
+          `);
+        }
+        tableBody.innerHTML = rows.join('');
+      }
+
       // Coordinate system setup
       const width = 540;
       const height = 180;
       const padLeft = 48;
-      const padRight = 20;
+      const padRight = 36;
       const padTop = 24;
       const padBottom = 26;
       const plotW = width - padLeft - padRight;
@@ -1423,6 +1513,11 @@
         const y = yMax - frac * plotH;
         return { val, y, label: formatAxisToken(val) };
       });
+
+      const rightTicks = [0, 0.5, 1.0].map(frac => ({
+        y: yMax - frac * plotH,
+        label: `${Math.round(frac * 100)}%`
+      }));
 
       // X-axis turn ticks: select 4-6 evenly spaced turns
       const totalPoints = points.length;
@@ -1447,10 +1542,13 @@
       const coords = points.map((p, i) => {
         const x = padLeft + (i / Math.max(1, totalPoints - 1)) * plotW;
         const y = yMax - (p.total_context / niceMax) * plotH;
-        return { x, y, p, i };
+        const cacheRatio = getTurnCacheRatio(p);
+        const cacheY = yMax - (Math.max(0, Math.min(100, cacheRatio)) / 100) * plotH;
+        return { x, y, cacheY, cacheRatio, p, i };
       });
 
       const lineD = 'M ' + coords.map(c => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' L ');
+      const cacheLineD = 'M ' + coords.map(c => `${c.x.toFixed(1)},${c.cacheY.toFixed(1)}`).join(' L ');
       const areaD = lineD + ` L ${coords[coords.length - 1].x.toFixed(1)},${yMax} L ${coords[0].x.toFixed(1)},${yMax} Z`;
 
       // Peak coordinate
@@ -1461,6 +1559,10 @@
       const yGridLines = yTicks.map(t => `
         <line x1="${padLeft}" y1="${t.y.toFixed(1)}" x2="${xMax}" y2="${t.y.toFixed(1)}" stroke="var(--border)" stroke-dasharray="3,3" opacity="0.6" stroke-width="0.8" />
         <text x="${padLeft - 6}" y="${(t.y + 3).toFixed(1)}" text-anchor="end" font-size="9" font-family="'Google Sans Code', monospace" fill="var(--muted-foreground)">${t.label}</text>
+      `).join('');
+
+      const rightAxisLabels = rightTicks.map(t => `
+        <text x="${xMax + 5}" y="${(t.y + 3).toFixed(1)}" text-anchor="start" font-size="8.5" font-family="'Google Sans Code', monospace" fill="#16a34a" opacity="0.85">${t.label}</text>
       `).join('');
 
       const xAxisTicks = xTicks.map(t => `
@@ -1487,13 +1589,15 @@
 
         <!-- Y Axis Grid & Labels -->
         ${yGridLines}
+        ${rightAxisLabels}
 
         <!-- X Axis Base Line & Ticks -->
         <line x1="${padLeft}" y1="${yMax}" x2="${xMax}" y2="${yMax}" stroke="var(--border)" stroke-width="1.2" />
         ${xAxisTicks}
 
-        <!-- Area & Curve -->
+        <!-- Area & Curves -->
         <path d="${areaD}" fill="url(#tlGradient)" />
+        <path d="${cacheLineD}" fill="none" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="4,2.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.85" />
         <path d="${lineD}" fill="none" stroke="var(--foreground)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
 
         <!-- Point dots -->
@@ -1512,6 +1616,7 @@
         <!-- Interactive Crosshair (Hidden by default) -->
         <g id="tl-crosshair-group" style="display: none;">
           <line id="tl-crosshair-line" x1="0" y1="${padTop}" x2="0" y2="${yMax}" stroke="var(--muted-foreground)" stroke-dasharray="2,2" stroke-width="1" opacity="0.8" />
+          <circle id="tl-crosshair-cache-dot" cx="0" cy="0" r="3.5" fill="#16a34a" stroke="var(--card)" stroke-width="1.5" />
           <circle id="tl-crosshair-dot" cx="0" cy="0" r="4.5" fill="var(--foreground)" stroke="var(--card)" stroke-width="2" />
         </g>
       `;
@@ -1520,6 +1625,7 @@
       const crosshair = document.getElementById('tl-crosshair-group');
       const crossLine = document.getElementById('tl-crosshair-line');
       const crossDot = document.getElementById('tl-crosshair-dot');
+      const crossCacheDot = document.getElementById('tl-crosshair-cache-dot');
 
       svg.onmousemove = (e) => {
         const rect = svg.getBoundingClientRect();
@@ -1546,11 +1652,16 @@
           crossDot.setAttribute('cx', c.x.toFixed(1));
           crossDot.setAttribute('cy', c.y.toFixed(1));
         }
+        if (crossCacheDot) {
+          crossCacheDot.setAttribute('cx', c.x.toFixed(1));
+          crossCacheDot.setAttribute('cy', c.cacheY.toFixed(1));
+        }
 
         const ttTurn = document.getElementById('tt-turn');
         const ttStep = document.getElementById('tt-step');
         const ttTotal = document.getElementById('tt-total');
         const ttCache = document.getElementById('tt-cache');
+        const ttCacheRatio = document.getElementById('tt-cache-ratio');
         const ttInput = document.getElementById('tt-input');
         const ttOutput = document.getElementById('tt-output');
 
@@ -1558,6 +1669,12 @@
         if (ttStep) ttStep.textContent = `Step ${c.p.step}`;
         if (ttTotal) ttTotal.textContent = `${c.p.total_context.toLocaleString()} tok`;
         if (ttCache) ttCache.textContent = `${(c.p.cache_tokens || 0).toLocaleString()} tok`;
+        if (ttCacheRatio) {
+          ttCacheRatio.textContent = `${c.cacheRatio.toFixed(1)}%`;
+          ttCacheRatio.className = c.cacheRatio >= 70
+            ? 'font-mono font-semibold text-[#16a34a]'
+            : (c.cacheRatio >= 40 ? 'font-mono font-semibold text-[#d97706]' : 'font-mono font-semibold text-[#dc2626]');
+        }
         if (ttInput) ttInput.textContent = `${(c.p.input_tokens || 0).toLocaleString()} tok`;
         if (ttOutput) ttOutput.textContent = `${(c.p.output_tokens || 0).toLocaleString()} tok`;
 
@@ -1603,12 +1720,12 @@
     // This view is never polled by the 10s timer; it only loads on explicit
     // entry / refresh, and never applies anything automatically.
     // ==========================================
-    const KERNEL_MODES = ['stock', '512k', '900k'];
+    const KERNEL_MODES = ['stock', '512k', '900k', 'dynamic'];
     // Display values used to compare the on-disk mode against live telemetry.
-    // 512k budget/display = 512000; 900k compression fallback = 900000,
-    // client displays ~983040.
-    const KERNEL_MODE_LIMITS = { '512k': 512000, '900k': 983040 };
-    const KERNEL_MODE_LABELS = { 'stock': '原生 (Stock)', '512k': '512K', '900k': '900K' };
+    // 512k budget = 512000; 900k compression fallback = 900000;
+    // dynamic removes the 256K clamp (~983040 on 1M-context models).
+    const KERNEL_MODE_LIMITS = { '512k': 512000, '900k': 900000, 'dynamic': 983040 };
+    const KERNEL_MODE_LABELS = { 'stock': '原生 (Stock)', '512k': '512K', '900k': '900K', 'dynamic': '动态上限 (Dynamic)' };
     const KERNEL_DRAFT_SEP = '\u0000';
 
     const kernelState = {
@@ -1621,7 +1738,8 @@
       busy: false,
       selectedMode: null,
       selectedTemplate: '',
-      drafts: {}
+      drafts: {},
+      pendingConfirmAction: null
     };
 
     function kernelDraftKey(targetId, name) {
@@ -1657,21 +1775,25 @@
       const s = kernelState;
       const insp = s.inspection;
       const ctxOk = !!(insp && insp.context && insp.context.supported);
+      const blockedByStale = !!(insp && insp.staleBackup && !insp.canAutoRebaseline);
       const tpl = currentKernelTemplate();
       const editable = !!(tpl && tpl.editable);
       const bytes = kernelEditorBytes();
       const overCapacity = !!(tpl && typeof tpl.capacity === 'number' && tpl.capacity > 0 && bytes > tpl.capacity);
       const dis = (id, cond) => { const el = document.getElementById(id); if (el) el.disabled = !!cond; };
-      dis('kernel-mode-stock', s.busy || !ctxOk);
-      dis('kernel-mode-512k', s.busy || !ctxOk);
-      dis('kernel-mode-900k', s.busy || !ctxOk);
-      dis('kernel-apply-context-btn', s.busy || !ctxOk);
+      dis('kernel-mode-stock', s.busy || blockedByStale || !ctxOk);
+      dis('kernel-mode-512k', s.busy || blockedByStale || !ctxOk);
+      dis('kernel-mode-900k', s.busy || blockedByStale || !ctxOk);
+      dis('kernel-mode-dynamic', s.busy || blockedByStale || !ctxOk);
+      dis('kernel-apply-context-btn', s.busy || blockedByStale || !ctxOk);
       dis('kernel-template-select', s.busy || !insp || !insp.templates || insp.templates.length === 0);
       dis('kernel-template-editor', s.busy || !editable);
-      dis('kernel-save-template-btn', s.busy || !editable || overCapacity);
+      dis('kernel-save-template-btn', s.busy || blockedByStale || !editable || overCapacity);
       dis('kernel-clear-template-btn', s.busy || !editable);
       dis('kernel-restore-prompts-btn', s.busy || !insp || !insp.backupAvailable);
       dis('kernel-restore-all-btn', s.busy || !insp || !insp.backupAvailable);
+      dis('kernel-confirm-cancel-btn', s.busy);
+      dis('kernel-confirm-ok-btn', s.busy);
     }
 
     function showKernelError(message) {
@@ -1698,9 +1820,34 @@
       if (el) el.classList.add('hidden');
     }
 
+    function requestKernelConfirm(message, action) {
+      kernelState.pendingConfirmAction = action;
+      const bar = document.getElementById('kernel-confirm-bar');
+      const txt = document.getElementById('kernel-confirm-text');
+      if (txt) txt.textContent = message;
+      if (bar) {
+        bar.classList.remove('hidden');
+        bar.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    }
+
+    function cancelKernelConfirm() {
+      kernelState.pendingConfirmAction = null;
+      const bar = document.getElementById('kernel-confirm-bar');
+      if (bar) bar.classList.add('hidden');
+    }
+
+    async function acceptKernelConfirm() {
+      if (kernelState.busy) return;
+      const action = kernelState.pendingConfirmAction;
+      cancelKernelConfirm();
+      if (typeof action === 'function') await action();
+    }
+
     async function kernelSettingsEnter() {
       clearKernelError();
       clearKernelMessage();
+      cancelKernelConfirm();
       await loadKernelTargets();
       fetchKernelLiveTelemetry();
     }
@@ -1755,6 +1902,7 @@
       if (kernelState.busy) return;
       const sel = document.getElementById('kernel-target-select');
       if (!sel || !sel.value) return;
+      cancelKernelConfirm();
       kernelState.selectedTargetId = sel.value;
       kernelState.selectedTemplate = '';
       kernelState.selectedMode = null;
@@ -1802,16 +1950,17 @@
       setTxt('kernel-hash', insp && insp.hash ? insp.hash : '--');
       const hashEl = document.getElementById('kernel-hash');
       if (hashEl) hashEl.title = (insp && insp.hash) || '';
-      setTxt('kernel-arch', insp ? `${insp.format || '--'} / ${insp.arch || '--'}` : '--');
 
       const ctx = insp && insp.context ? insp.context : null;
+      const kind = ctx && ctx.targetKind === 'cli' ? ' · CLI' : ctx && ctx.targetKind === 'server' ? ' · Server' : '';
+      setTxt('kernel-arch', insp ? `${insp.format || '--'} / ${insp.arch || '--'}${kind}` : '--');
       const supported = !!(ctx && ctx.supported);
       setTxt('kernel-context-supported', insp ? (supported ? '支持' : '不支持') : '--');
       setTxt('kernel-context-mode', ctx && ctx.mode ? ctx.mode : '--');
       setTxt('kernel-context-reason', (ctx && ctx.reason) || '--');
       showRow('kernel-context-reason-row', !!(ctx && ctx.reason));
 
-      setTxt('kernel-backup-status', insp ? (insp.backupAvailable ? '可用' : '不可用') : '--');
+      setTxt('kernel-backup-status', insp ? (insp.staleBackup ? (insp.canAutoRebaseline ? '已更新 (下次修改自动重建)' : '已过期 (需先恢复原版)') : (insp.backupAvailable ? '可用' : '尚未创建')) : '--');
       setTxt('kernel-backup-path', (insp && insp.backupPath) || '--');
       showRow('kernel-backup-path-row', !!(insp && insp.backupPath));
 
@@ -1883,6 +2032,7 @@
     async function kernelApply(payload, onSuccess) {
       const s = kernelState;
       if (s.busy || !s.inspection || !s.selectedTargetId) return;
+      cancelKernelConfirm();
       setKernelBusy(true, '正在写入修改...');
       clearKernelError();
       clearKernelMessage();
@@ -2063,27 +2213,29 @@
       });
     }
 
-    async function restoreKernelPrompts() {
+    function restoreKernelPrompts() {
       const s = kernelState;
       if (s.busy || !s.inspection) return;
-      if (!window.confirm('确定要恢复全部内置提示词为原始内容吗？该目标的未保存草稿将被丢弃。')) return;
-      await kernelApply({ restorePrompts: true }, () => {
-        Object.keys(s.drafts).forEach(k => {
-          if (k.indexOf(s.selectedTargetId + KERNEL_DRAFT_SEP) === 0) delete s.drafts[k];
-        });
-      });
+      requestKernelConfirm('确定要恢复全部内置提示词为原始内容吗？该目标的未保存草稿将被丢弃。', () =>
+        kernelApply({ restorePrompts: true }, () => {
+          Object.keys(s.drafts).forEach(k => {
+            if (k.indexOf(s.selectedTargetId + KERNEL_DRAFT_SEP) === 0) delete s.drafts[k];
+          });
+        })
+      );
     }
 
-    async function restoreKernelAll() {
+    function restoreKernelAll() {
       const s = kernelState;
       if (s.busy || !s.inspection) return;
-      if (!window.confirm('确定要将整个可执行文件恢复为原始备份吗？上下文解锁与提示词修改都会被撤销。')) return;
-      await kernelApply({ restoreAll: true }, () => {
-        s.restartPending = true;
-        Object.keys(s.drafts).forEach(k => {
-          if (k.indexOf(s.selectedTargetId + KERNEL_DRAFT_SEP) === 0) delete s.drafts[k];
-        });
-      });
+      requestKernelConfirm('确定要将整个可执行文件恢复为原始备份吗？上下文解锁与提示词修改都会被撤销。', () =>
+        kernelApply({ restoreAll: true }, () => {
+          s.restartPending = true;
+          Object.keys(s.drafts).forEach(k => {
+            if (k.indexOf(s.selectedTargetId + KERNEL_DRAFT_SEP) === 0) delete s.drafts[k];
+          });
+        })
+      );
     }
 
     async function fetchKernelLiveTelemetry() {

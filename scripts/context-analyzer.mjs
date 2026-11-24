@@ -1344,6 +1344,8 @@ export async function analyzeTranscript(transcriptPath, options = {}) {
   let totalOutputTokens = 0;
   let totalCacheReadTokens = 0;
   let totalModelTurns = 0;
+  let cumulativeInputTokens = 0;
+  let cumulativeCacheReadTokens = 0;
 
   let systemTokens = 0;
   let toolsTokens = 0;
@@ -1393,6 +1395,11 @@ export async function analyzeTranscript(transcriptPath, options = {}) {
       totalCacheReadTokens = cch;
       totalOutputTokens += out;
       currentContext = inp + cch;
+      cumulativeInputTokens += inp;
+      cumulativeCacheReadTokens += cch;
+      const turnCacheHitRatio = currentContext > 0
+        ? Number(((cch / currentContext) * 100).toFixed(1))
+        : 0;
 
       timeline.push({
         step: stepIndex,
@@ -1401,6 +1408,7 @@ export async function analyzeTranscript(transcriptPath, options = {}) {
         cache_tokens: cch,
         output_tokens: out,
         total_context: currentContext,
+        cache_hit_ratio: turnCacheHitRatio,
         timestamp: entry.created_at || null
       });
     }
@@ -1540,6 +1548,10 @@ export async function analyzeTranscript(transcriptPath, options = {}) {
   const cacheHitRatio = totalInputWindow > 0 
     ? Number(((totalCacheReadTokens / totalInputWindow) * 100).toFixed(1))
     : 0;
+  const cumulativeWindow = cumulativeInputTokens + cumulativeCacheReadTokens;
+  const avgCacheHitRatio = cumulativeWindow > 0
+    ? Number(((cumulativeCacheReadTokens / cumulativeWindow) * 100).toFixed(1))
+    : 0;
 
   topConsumers.sort((a, b) => b.tokens - a.tokens);
 
@@ -1593,6 +1605,7 @@ export async function analyzeTranscript(transcriptPath, options = {}) {
       healthStatus,
       healthLevel,
       cacheHitRatio,
+      avgCacheHitRatio,
       cacheTokens: totalCacheReadTokens,
       uncachedTokens: totalInputTokens,
       totalOutputTokens,

@@ -1,17 +1,44 @@
 // Format-aware, fixed-size patches. Reference signatures: justhil/agy-tool
-// (https://github.com/justhil/agy-tool); ARM64 patterns inspected on desktop 2.32.1.
+// (https://github.com/justhil/agy-tool) and q1uuuu/agy-context (agy-patch.py);
+// ARM64 patterns inspected on desktop 2.32.1 and agy CLI 1.4.12+.
 // Never search/replace numeric limits globally: every code patch is scoped to
 // its Go function and requires an exact, unique instruction sequence.
 const PREFIX = 'google3/third_party/jetski/prompt/template_provider/templates/system_prompts/';
-const CHECKPOINT = 'google3/third_party/jetski/cortex/utils/utils.GetCheckpointConfig';
-const SERIALIZER = 'google3/third_party/oneharness/internal/core/serializers/serializers.DefaultSerializer.populateContextWindowMetadata';
-const MODES = ['stock', '512k', '900k'];
+const CHECKPOINT = 'utils.GetCheckpointConfig';
+const EXP_CHECKPOINT = 'config.applyFeatureProviderCheckpointOverrideConfig';
+const SELECT_EXP_KEY = 'config.selectCheckpointExperimentKey';
+const OFFERS_CW = 'model.SelectorModel.offersContextWindow';
+const STORE_CW = 'store.(*Store).ContextWindow';
+const STORE_CHOICE = 'store.(*Store).ContextWindowChoice';
+const AUTO_COMPACT_OVERRIDE = 'store.AutoCompactOverride';
+const APPLY_EDITS = 'genericsystemprompt.applyEdits';
+const TARGET_SYMBOLS = new Set([
+  CHECKPOINT,
+  EXP_CHECKPOINT,
+  SELECT_EXP_KEY,
+  OFFERS_CW,
+  STORE_CW,
+  STORE_CHOICE,
+  AUTO_COMPACT_OVERRIDE
+]);
+const CLI_SYMS = [OFFERS_CW, STORE_CW, STORE_CHOICE];
+
+const MODES = ['stock', '512k', '900k', 'dynamic'];
+const MODE_LIMITS = { '512k': 512000, '900k': 900000 };
+const STOCK_LIMITS = new Set([256000, 200000, 128000]);
+
+const NOP_ARM64 = 0xd503201f;
+const RET_ARM64 = 0xd65f03c0;
+
 const hex = value => Buffer.from(value.replaceAll(' ', ''), 'hex');
 const words = (...values) => {
   const result = Buffer.alloc(values.length * 4);
   values.forEach((value, i) => result.writeUInt32LE(value >>> 0, i * 4));
   return result;
 };
+
+const RET_TRUE_ARM64 = words(0x52800020, 0xd65f03c0);
+const RET_TRUE_X64 = hex('b801000000c3');
 
 function bounds(buf, offset, size) {
   if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(size) || offset < 0 || size < 0 || offset + size > buf.length) {
@@ -72,7 +99,8 @@ function layout(buf) {
     const pe = buf.readUInt32LE(0x3c);
     bounds(buf, pe, 112);
     if (buf.readUInt32LE(pe) !== 0x4550 || buf.readUInt16LE(pe + 24) !== 0x20b) throw new Error('仅支持 PE64');
-    arch = buf.readUInt16LE(pe + 4) === 0x8664 ? 'x64' : 'unknown';
+    const machine = buf.readUInt16LE(pe + 4);
+    arch = machine === 0x8664 ? 'x64' : machine === 0xaa64 ? 'arm64' : 'unknown';
     const imageBase = u64(buf, pe + 48);
     const count = buf.readUInt16LE(pe + 6), table = pe + 24 + buf.readUInt16LE(pe + 20);
     bounds(buf, table, count * 40);
@@ -177,91 +205,495 @@ function functions(buf, image) {
     const end = buf.indexOf(0, nameStart);
     if (end < 0 || end - nameStart > 4096) throw new Error('无效 Go 函数名称');
     const name = buf.toString('utf8', nameStart, end);
-    if (name === CHECKPOINT || name === SERIALIZER || name.endsWith('genericsystemprompt.applyEdits')) {
+    const tail = name.slice(name.lastIndexOf('/') + 1);
+    const key = TARGET_SYMBOLS.has(tail) ? tail : name.endsWith(APPLY_EDITS) ? APPLY_EDITS : null;
+    if (key) {
+      if (result.has(key)) throw new Error('发现重复 Go 函数符号，拒绝修改');
       const startPc = buf.readUInt32LE(table + i * 8), endPc = buf.readUInt32LE(table + (i + 1) * 8);
+      if (endPc < startPc) throw new Error('无效 Go 函数边界');
       const start = image.toOffset(text + startPc, endPc - startPc);
-      result.set(name, { start, end: start + endPc - startPc });
+      result.set(key, { start, end: start + endPc - startPc, va: text + startPc });
     }
   }
   return result;
 }
 
-const X64 = [
-  ['main', CHECKPOINT, '8b54244c81fa00e80300be00e803000f42f289742450', '8b54244c81fa00d00700be00d007000f42f289742450', '8b54244c81fa00e8030089d690909090909089742450'],
-  ['fallback', CHECKPOINT, '837a14007f07c7400c00e80300', '837a14007f07c7400c00d00700', '837a14007f07c7400ca0bb0d00'],
-  ['display', SERIALIZER, '4889442470488b8c24a80100008908b830000000', '4889442470c70000d0070090909090b830000000', '4889442470c70000000f0090909090b830000000'],
-  ['ide-main', CHECKPOINT, '8b4c245429d181f900f40100ba00f401000f42d18954244c', '8b4c245429d181f900d00700ba00d007000f42d18954244c', '8b4c245429d181f900f4010089ca9090909090908954244c']
-];
-const ARM = [
-  ['main', CHECKPOINT,
-    words(0xb94057e3, 0xd29d0004, 0xf2a00064, 0x6b04007f, 0xd29d0004, 0xf2a00064, 0x9a843063, 0xb9005be3),
-    words(0xb94057e3, 0xd29a0004, 0xf2a000e4, 0x6b04007f, 0xd29a0004, 0xf2a000e4, 0x9a843063, 0xb9005be3),
-    words(0xb94057e3, 0xd29d0004, 0xf2a00064, 0x6b04007f, 0xd29d0004, 0xf2a00064, 0xd503201f, 0xb9005be3)],
-  ['fallback', CHECKPOINT,
-    words(0x7100007f, 0x5400008c, 0xd29d0003, 0xf2a00063, 0xb9000c03),
-    words(0x7100007f, 0x5400008c, 0xd29a0003, 0xf2a000e3, 0xb9000c03),
-    words(0x7100007f, 0x5400008c, 0xd2977403, 0xf2a001a3, 0xb9000c03)]
-];
+function encodeB(pc, target) {
+  const delta = target - pc;
+  if (delta % 4 !== 0 || delta < -(1 << 27) || delta >= (1 << 27)) {
+    throw new Error('ARM64 跳转目标超出指令范围');
+  }
+  return (0x14000000 | ((delta >> 2) & 0x03ffffff)) >>> 0;
+}
 
-function matchGate(buf, range, id, variants) {
-  if (!range) return null;
+function decodeBlTarget(pc, word) {
+  if (((word & 0xfc000000) >>> 0) !== 0x94000000) return null;
+  let imm26 = word & 0x03ffffff;
+  if (imm26 & 0x02000000) imm26 -= 0x04000000;
+  return pc + imm26 * 4;
+}
+
+function decodeSignedImm19Bytes(word) {
+  let imm19 = (word >>> 5) & 0x7ffff;
+  if (imm19 & 0x40000) imm19 -= 0x80000;
+  return imm19 * 4;
+}
+
+function matchGate3aArm64(buf, fn) {
   const hits = [];
-  variants.forEach((bytes, index) => {
-    const offset = unique(buf, bytes, range.start, range.end);
-    if (offset >= 0) hits.push({ id, offset, mode: MODES[index], variants });
-  });
+  for (let off = fn.start; off <= fn.end - 16; off += 4) {
+    const w0 = buf.readUInt32LE(off);
+    const w1 = buf.readUInt32LE(off + 4);
+    if (((w0 & 0xffe00000) >>> 0) !== 0xd2800000) continue;
+    const regLim = w0 & 0x1f;
+    if (((w1 & 0xffe0001f) >>> 0) !== ((0xf2a00000 | regLim) >>> 0)) continue;
+    const currLim = (((w0 >>> 5) & 0xffff) | (((w1 >>> 5) & 0xffff) << 16)) >>> 0;
+    if (currLim < 100000) continue;
+    const w2 = buf.readUInt32LE(off + 8);
+    const w2Masked = (w2 & 0xfffffc1f) >>> 0;
+    const cmp32 = (0x6b00001f | (regLim << 16)) >>> 0;
+    const cmp64 = (0xeb00001f | (regLim << 16)) >>> 0;
+    if (w2Masked !== cmp32 && w2Masked !== cmp64) continue;
+    const regDst = (w2 >>> 5) & 0x1f;
+    if (regDst === regLim) continue;
+
+    let wordCount = 4;
+    let wLast = buf.readUInt32LE(off + 12);
+    if (off + 24 <= fn.end && buf.readUInt32LE(off + 12) === w0 && buf.readUInt32LE(off + 16) === w1) {
+      wordCount = 6;
+      wLast = buf.readUInt32LE(off + 20);
+    }
+
+    const csel64 = (0x9a803000 | (regLim << 16) | (regDst << 5) | regDst) >>> 0;
+    const csel32 = (0x1a803000 | (regLim << 16) | (regDst << 5) | regDst) >>> 0;
+    let mode = null;
+    let cselOp = csel64;
+    if (wLast === csel64 || wLast === csel32) {
+      cselOp = wLast;
+      mode = STOCK_LIMITS.has(currLim) ? 'stock' : currLim === 512000 ? '512k' : currLim === 900000 ? '900k' : null;
+    } else if (wLast === NOP_ARM64 && STOCK_LIMITS.has(currLim)) {
+      mode = 'dynamic';
+    } else {
+      continue;
+    }
+
+    hits.push({
+      id: 'gate3a',
+      offset: off,
+      length: wordCount * 4,
+      mode,
+      stockLim: STOCK_LIMITS.has(currLim) ? currLim : 256000,
+      cselOp,
+      encode(targetMode, saved) {
+        const lim = targetMode === 'dynamic' ? (saved.stockLim || 256000) : MODE_LIMITS[targetMode];
+        const mw0 = (0xd2800000 | ((lim & 0xffff) << 5) | regLim) >>> 0;
+        const mw1 = (0xf2a00000 | (((lim >>> 16) & 0xffff) << 5) | regLim) >>> 0;
+        const tailOp = targetMode === 'dynamic' ? NOP_ARM64 : saved.cselOp;
+        return wordCount === 6
+          ? words(mw0, mw1, w2, mw0, mw1, tailOp)
+          : words(mw0, mw1, w2, tailOp);
+      }
+    });
+    off += (wordCount - 1) * 4;
+  }
+  if (hits.length === 0) return null;
+  if (hits.length > 1) throw new Error('上下文补丁状态有歧义');
+  if (!hits[0].mode) throw new Error('发现未识别的上下文限制数值，请先恢复官方原版二进制文件');
+  return hits[0];
+}
+
+function matchGate3aX64(buf, fn) {
+  const hits = [];
+  for (let off = fn.start; off <= fn.end - 14; off++) {
+    if (buf[off] !== 0x81 || buf[off + 1] < 0xf8) continue;
+    const regSrc = buf[off + 1] - 0xf8;
+    const cmpLim = buf.readUInt32LE(off + 2);
+    if (cmpLim < 100000) continue;
+    let regDst = null;
+    let mode = null;
+    if (
+      buf[off + 6] >= 0xb8 && buf[off + 6] <= 0xbf &&
+      buf.readUInt32LE(off + 7) === cmpLim &&
+      buf[off + 11] === 0x0f && buf[off + 12] === 0x42
+    ) {
+      const candDst = buf[off + 6] - 0xb8;
+      if (buf[off + 13] === (0xc0 | (candDst << 3) | regSrc)) {
+        regDst = candDst;
+        mode = STOCK_LIMITS.has(cmpLim) ? 'stock' : cmpLim === 512000 ? '512k' : cmpLim === 900000 ? '900k' : null;
+      }
+    } else if (
+      STOCK_LIMITS.has(cmpLim) &&
+      buf[off + 6] === 0x89 && buf[off + 7] >= 0xc0 &&
+      ((buf[off + 7] - 0xc0) >> 3) === regSrc &&
+      buf.subarray(off + 8, off + 14).every(b => b === 0x90)
+    ) {
+      regDst = (buf[off + 7] - 0xc0) & 7;
+      mode = 'dynamic';
+    }
+    if (regDst === null) continue;
+    hits.push({
+      id: 'gate3a',
+      offset: off,
+      length: 14,
+      mode,
+      stockLim: STOCK_LIMITS.has(cmpLim) ? cmpLim : 256000,
+      encode(targetMode, saved) {
+        const out = Buffer.alloc(14);
+        out[0] = 0x81;
+        out[1] = 0xf8 + regSrc;
+        if (targetMode === 'dynamic') {
+          out.writeUInt32LE(saved.stockLim || 256000, 2);
+          out[6] = 0x89;
+          out[7] = 0xc0 + regSrc * 8 + regDst;
+          out.fill(0x90, 8, 14);
+        } else {
+          const lim = MODE_LIMITS[targetMode];
+          out.writeUInt32LE(lim, 2);
+          out[6] = 0xb8 + regDst;
+          out.writeUInt32LE(lim, 7);
+          out[11] = 0x0f;
+          out[12] = 0x42;
+          out[13] = 0xc0 + regDst * 8 + regSrc;
+        }
+        return out;
+      }
+    });
+    off += 13;
+  }
+  if (hits.length === 0) return null;
+  if (hits.length > 1) throw new Error('上下文补丁状态有歧义');
+  if (!hits[0].mode) throw new Error('发现未识别的上下文限制数值，请先恢复官方原版二进制文件');
+  return hits[0];
+}
+
+function matchGate3a(buf, image, funcs) {
+  const fn = funcs.get(CHECKPOINT);
+  if (!fn) return null;
+  if (image.arch === 'arm64') return matchGate3aArm64(buf, fn);
+  if (image.arch === 'x64') return matchGate3aX64(buf, fn);
+  return null;
+}
+
+function matchGate3bArm64(buf, fn, funcs) {
+  const fnSize = fn.end - fn.start;
+  const primaryHits = [];
+  for (let rel = 4; rel <= fnSize - 16; rel += 4) {
+    const wPrev = buf.readUInt32LE(fn.start + rel - 4);
+    if (((wPrev & 0xfc000000) >>> 0) !== 0x94000000) continue;
+    const w0 = buf.readUInt32LE(fn.start + rel);
+    const op0 = (w0 & 0xff00001f) >>> 0;
+    if (op0 !== 0xb4000001 && op0 !== 0xb4000000) continue;
+    const span = decodeSignedImm19Bytes(w0);
+    if (span < 8 || span > 64 || span % 4 !== 0 || rel + span + 8 > fnSize) continue;
+    const wm0 = buf.readUInt32LE(fn.start + rel + span);
+    const wm1 = buf.readUInt32LE(fn.start + rel + span + 4);
+    if (((wm0 & 0xffc003ff) >>> 0) !== 0xf94003e1 || wm1 !== 0xaa0003e2) continue;
+    const unlockedBytes = words(
+      (w0 & 0xffffffe0) >>> 0,
+      0xb9000c1f,
+      ...Array((span - 8) / 4).fill(NOP_ARM64)
+    );
+    let state = null;
+    if (op0 === 0xb4000001) {
+      state = 'stock';
+    } else if (buf.subarray(fn.start + rel, fn.start + rel + span).equals(unlockedBytes)) {
+      state = 'unlocked';
+    } else {
+      continue;
+    }
+    primaryHits.push({
+      id: 'gate3b',
+      offset: fn.start + rel,
+      length: span,
+      state,
+      mode: state,
+      encode: () => unlockedBytes
+    });
+  }
+  if (primaryHits.length > 1) throw new Error('上下文补丁状态有歧义');
+  if (primaryHits.length === 1) return primaryHits[0];
+
+  const selFn = funcs.get(SELECT_EXP_KEY);
+  if (!selFn) return null;
+  const fallbackHits = [];
+  for (let rel = 0; rel <= fnSize - 16; rel += 4) {
+    const w = buf.readUInt32LE(fn.start + rel);
+    if (decodeBlTarget(fn.va + rel, w) !== selFn.va) continue;
+    const scanEnd = Math.min(rel + 72, fnSize - 4);
+    for (let scan = rel + 4; scan < scanEnd; scan += 4) {
+      const wb = buf.readUInt32LE(fn.start + scan);
+      if (((wb & 0xfffffc1f) >>> 0) !== 0xd63f0000) continue;
+      const wn = buf.readUInt32LE(fn.start + scan + 4);
+      let state = null;
+      if (wn === NOP_ARM64) state = 'unlocked';
+      else if (((wn & 0xfffe001f) >>> 0) === 0x37000000 || ((wn & 0x7f00001f) >>> 0) === 0x35000000) state = 'stock';
+      else continue;
+      const unlockedBytes = words(NOP_ARM64);
+      fallbackHits.push({
+        id: 'gate3b',
+        offset: fn.start + scan + 4,
+        length: 4,
+        state,
+        mode: state,
+        encode: () => unlockedBytes
+      });
+      break;
+    }
+  }
+  if (fallbackHits.length > 1) throw new Error('上下文补丁状态有歧义');
+  return fallbackHits[0] || null;
+}
+
+function matchGate3bX64(buf, fn, funcs) {
+  const selFn = funcs.get(SELECT_EXP_KEY);
+  if (!selFn) return null;
+  const fnSize = fn.end - fn.start;
+  const hits = [];
+  const testAl = Buffer.from([0x84, 0xc0]);
+  for (let rel = 0; rel <= fnSize - 12; rel++) {
+    if (buf[fn.start + rel] !== 0xe8) continue;
+    const disp = buf.readInt32LE(fn.start + rel + 1);
+    if (fn.va + rel + 5 + disp !== selFn.va) continue;
+    const winStart = fn.start + rel + 5;
+    const winEnd = Math.min(fn.end, winStart + 100);
+    const tIdx = buf.subarray(winStart, winEnd).indexOf(testAl);
+    if (tIdx < 0) continue;
+    const jSite = winStart + tIdx + 2;
+    let len = 0;
+    let state = null;
+    if (jSite + 6 <= fn.end && buf.subarray(jSite, jSite + 6).every(b => b === 0x90)) {
+      len = 6; state = 'unlocked';
+    } else if (jSite + 2 <= fn.end && buf[jSite] === 0x90 && buf[jSite + 1] === 0x90) {
+      len = 2; state = 'unlocked';
+    } else if (jSite + 2 <= fn.end && buf[jSite] === 0x75) {
+      len = 2; state = 'stock';
+    } else if (jSite + 6 <= fn.end && buf[jSite] === 0x0f && buf[jSite + 1] === 0x85) {
+      len = 6; state = 'stock';
+    } else {
+      continue;
+    }
+    const unlockedBytes = Buffer.alloc(len, 0x90);
+    hits.push({
+      id: 'gate3b',
+      offset: jSite,
+      length: len,
+      state,
+      mode: state,
+      encode: () => unlockedBytes
+    });
+  }
   if (hits.length > 1) throw new Error('上下文补丁状态有歧义');
   return hits[0] || null;
 }
 
-function contextGates(buf, image, funcs) {
-  const specs = image.arch === 'x64' ? X64.map(([id, fn, ...bytes]) => [id, fn, ...bytes.map(hex)])
-    : image.format === 'Mach-O' && image.arch === 'arm64' ? ARM : [];
-  const gates = specs.map(([id, fn, ...variants]) => matchGate(buf, funcs.get(fn), id, variants)).filter(Boolean);
-  if (image.format === 'Mach-O' && image.arch === 'arm64') {
-    const range = funcs.get(SERIALIZER);
-    if (range && range.end - range.start > 12) {
-      // A literal in unreachable alignment padding lets one LDR load either
-      // display limit without moving instructions or truncating 512,000.
-      const cave = range.end - 4;
-      const branch = buf.readUInt32LE(cave - 4);
-      const imm26 = (branch & 0x3ffffff) << 6 >> 6;
-      if ((branch >>> 26) === 5 && cave - 4 + imm26 * 4 === range.start) {
-        const prefix = words(0xf90043e0);
-        const p = unique(buf, prefix, range.start, range.end);
-        if (p >= 0) {
-          const displacement = cave - (p + 4);
-          if (displacement % 4 === 0 && displacement < 1048576 && displacement > -1048576) {
-            const load = (0x18000001 | (((displacement / 4) & 0x7ffff) << 5)) >>> 0;
-            const variants = [words(0xf90043e0, 0xf940dfe1, 0xb9000001, 0xb27c07e0),
-              words(0xf90043e0, load, 0xb9000001, 0xb27c07e0)];
-            const stock = buf.subarray(p, p + 16).equals(variants[0]);
-            const patched = buf.subarray(p, p + 16).equals(variants[1]);
-            const literal = buf.readUInt32LE(cave);
-            const mode = stock && literal === 0 ? 'stock' : patched && literal === 512000 ? '512k' : patched && literal === 983040 ? '900k' : null;
-            if (mode) {
-              gates.push({ id: 'display', mode, offset: p, variants: [variants[0], variants[1], variants[1]] });
-              gates.push({ id: 'display-literal', mode, offset: cave, variants: [words(0), words(512000), words(983040)] });
-            }
-          }
-        }
-      }
+function matchGate3b(buf, image, funcs) {
+  const fn = funcs.get(EXP_CHECKPOINT);
+  if (!fn) return null;
+  if (image.arch === 'arm64') return matchGate3bArm64(buf, fn, funcs);
+  if (image.arch === 'x64') return matchGate3bX64(buf, fn, funcs);
+  return null;
+}
+
+function matchGate1(buf, image, funcs) {
+  const fn = funcs.get(OFFERS_CW);
+  if (!fn || fn.end - fn.start < 16) return null;
+  if (image.arch === 'arm64') {
+    const state = buf.subarray(fn.start, fn.start + 8).equals(RET_TRUE_ARM64)
+      ? 'unlocked'
+      : buf.readUInt32LE(fn.start) !== 0 ? 'stock' : null;
+    if (!state) return null;
+    return { id: 'gate1', offset: fn.start, length: 8, state, mode: state, encode: () => RET_TRUE_ARM64 };
+  }
+  if (image.arch === 'x64') {
+    const state = buf.subarray(fn.start, fn.start + 6).equals(RET_TRUE_X64)
+      ? 'unlocked'
+      : buf[fn.start] !== 0 && buf[fn.start] !== 0xcc ? 'stock' : null;
+    if (!state) return null;
+    return { id: 'gate1', offset: fn.start, length: 6, state, mode: state, encode: () => RET_TRUE_X64 };
+  }
+  return null;
+}
+
+function tryArm64RichGate2(buf, cwFn, choiceFn, ovFn) {
+  const cwSize = cwFn.end - cwFn.start;
+  if (!ovFn || cwSize < 0x100) return null;
+  let ldrX0Sp = null;
+  for (let rel = 0; rel < Math.min(0x40, cwSize); rel += 4) {
+    const w = buf.readUInt32LE(cwFn.start + rel);
+    if (((w & 0xffc003ff) >>> 0) === 0xf90003e0) {
+      ldrX0Sp = (0xf94003e0 | (w & 0x003ffc00)) >>> 0;
+      break;
     }
   }
-  const ids = gates.map(g => g.id);
-  const desktop = ['main', 'fallback', 'display'].every(id => ids.includes(id));
-  const ide = image.format === 'PE' && ids.length === 1 && ids[0] === 'ide-main';
-  const supported = desktop || ide;
-  const modes = new Set(gates.map(g => g.mode));
-  return { supported, mode: supported && modes.size === 1 ? gates[0].mode : 'unknown',
-    reason: supported ? undefined : '此版本缺少完整、唯一的已知上下文指令特征，未修改任何限制', gates };
+  if (ldrX0Sp === null) return null;
+  const argonHits = [];
+  for (let rel = 0x40; rel < cwSize - 8; rel += 4) {
+    const w0 = buf.readUInt32LE(cwFn.start + rel);
+    const w1 = buf.readUInt32LE(cwFn.start + rel + 4);
+    if (w0 === 0x92800000 && (((w1 & 0xfff8001f) >>> 0) === 0xb7f80000 || w1 === NOP_ARM64)) {
+      argonHits.push({ rel: rel + 4, state: w1 === NOP_ARM64 ? 'unlocked' : 'stock' });
+    }
+  }
+  if (argonHits.length !== 1) return null;
+  const argonHit = argonHits[0];
+  const blHits = [];
+  for (let rel = argonHit.rel + 4; rel < cwSize - 24; rel += 4) {
+    const w = buf.readUInt32LE(cwFn.start + rel);
+    if (decodeBlTarget(cwFn.va + rel, w) === ovFn.va) blHits.push(rel);
+  }
+  if (blHits.length !== 1) return null;
+  const blOvRel = blHits[0];
+  const wCbnz = buf.readUInt32LE(cwFn.start + blOvRel + 4);
+  if (((wCbnz & 0xff00001f) >>> 0) !== 0xb5000001) return null;
+  const epiRel = blOvRel + 4 + decodeSignedImm19Bytes(wCbnz);
+  if (epiRel <= 0 || epiRel > cwSize - 12) return null;
+  const epiW0 = buf.readUInt32LE(cwFn.start + epiRel);
+  const epiW1 = buf.readUInt32LE(cwFn.start + epiRel + 4);
+  const epiW2 = buf.readUInt32LE(cwFn.start + epiRel + 8);
+  if (epiW2 !== RET_ARM64) return null;
+  let tailRel = blOvRel + 8;
+  if (buf.readUInt32LE(cwFn.start + tailRel) === NOP_ARM64) tailRel += 4;
+  if (tailRel + 16 > epiRel) return null;
+  const tailBlob = words(ldrX0Sp, epiW0, epiW1, encodeB(cwFn.va + tailRel + 12, choiceFn.va));
+  const nopBlob = words(NOP_ARM64);
+  const tailOff = cwFn.start + tailRel;
+  const tailState = buf.subarray(tailOff, tailOff + 16).equals(tailBlob) ? 'unlocked' : 'stock';
+  return [
+    {
+      id: 'gate2-whitelist',
+      offset: cwFn.start + argonHit.rel,
+      length: 4,
+      state: argonHit.state,
+      mode: argonHit.state,
+      encode: () => nopBlob
+    },
+    {
+      id: 'gate2-tail',
+      offset: tailOff,
+      length: 16,
+      state: tailState,
+      mode: tailState,
+      encode: () => tailBlob
+    }
+  ];
+}
+
+function matchGate2(buf, image, funcs) {
+  const cwFn = funcs.get(STORE_CW);
+  const choiceFn = funcs.get(STORE_CHOICE);
+  if (!cwFn || !choiceFn) return [];
+  const cwSize = cwFn.end - cwFn.start;
+  if (image.arch === 'arm64') {
+    const entryJmp = words(encodeB(cwFn.va, choiceFn.va));
+    if (cwSize >= 4 && buf.subarray(cwFn.start, cwFn.start + 4).equals(entryJmp)) {
+      return [{ id: 'gate2', offset: cwFn.start, length: 4, state: 'unlocked', mode: 'unlocked', encode: () => entryJmp }];
+    }
+    const rich = tryArm64RichGate2(buf, cwFn, choiceFn, funcs.get(AUTO_COMPACT_OVERRIDE));
+    if (rich) return rich;
+    if (cwSize >= 16 && buf.readUInt32LE(cwFn.start) !== 0) {
+      return [{ id: 'gate2', offset: cwFn.start, length: 4, state: 'stock', mode: 'stock', encode: () => entryJmp }];
+    }
+    return [];
+  }
+  if (image.arch === 'x64') {
+    if (cwSize < 16) return [];
+    const rel32 = choiceFn.va - (cwFn.va + 5);
+    if (rel32 < -0x80000000 || rel32 > 0x7fffffff) {
+      throw new Error('Store.ContextWindow x64 跳转目标超出范围');
+    }
+    const entryJmp = Buffer.alloc(5);
+    entryJmp[0] = 0xe9;
+    entryJmp.writeInt32LE(rel32, 1);
+    const state = buf.subarray(cwFn.start, cwFn.start + 5).equals(entryJmp)
+      ? 'unlocked'
+      : buf[cwFn.start] !== 0 && buf[cwFn.start] !== 0xcc ? 'stock' : null;
+    if (!state) return [];
+    return [{ id: 'gate2', offset: cwFn.start, length: 5, state, mode: state, encode: () => entryJmp }];
+  }
+  return [];
+}
+
+function contextGates(buf, image, funcs) {
+  const isCli = CLI_SYMS.some(s => funcs.has(s));
+  const targetKind = isCli ? 'cli' : 'server';
+  const gates = [];
+
+  if (isCli) {
+    const g1 = matchGate1(buf, image, funcs);
+    const g2 = matchGate2(buf, image, funcs);
+    const g3a = matchGate3a(buf, image, funcs);
+    const g3b = matchGate3b(buf, image, funcs);
+    if (g1) gates.push(g1);
+    gates.push(...g2);
+    if (g3a) gates.push(g3a);
+    if (g3b) gates.push(g3b);
+
+    const hasAll = Boolean(
+      CLI_SYMS.every(s => funcs.has(s)) &&
+      funcs.has(CHECKPOINT) &&
+      funcs.has(EXP_CHECKPOINT) &&
+      g1 && g2.length > 0 && g3a && g3b
+    );
+    if (!hasAll) {
+      return {
+        supported: false,
+        targetKind,
+        mode: 'unknown',
+        reason: '此版本缺少完整、唯一的已知 CLI 上下文指令特征，未修改任何限制',
+        gates
+      };
+    }
+
+    const limitMode = g3a.mode;
+    const expectedState = limitMode === 'stock' ? 'stock' : 'unlocked';
+    const boolGates = [g1, ...g2, g3b];
+    if (boolGates.some(g => g.state !== expectedState)) {
+      return {
+        supported: false,
+        targetKind,
+        mode: 'unknown',
+        reason: '上下文补丁状态不一致，请先恢复官方原版二进制文件',
+        gates
+      };
+    }
+    for (const g of boolGates) g.mode = limitMode;
+    return { supported: true, targetKind, mode: limitMode, gates };
+  }
+
+  const g3a = matchGate3a(buf, image, funcs);
+  const g3b = matchGate3b(buf, image, funcs);
+  if (g3a) gates.push(g3a);
+  if (g3b) gates.push(g3b);
+  const legacyIdePe = !funcs.has(EXP_CHECKPOINT) && image.format === 'PE' && Boolean(g3a && g3a.stockLim === 128000);
+  const supported = Boolean(g3a && (g3b || legacyIdePe));
+  if (!supported) {
+    return {
+      supported: false,
+      targetKind,
+      mode: 'unknown',
+      reason: '此版本缺少完整、唯一的已知上下文指令特征，未修改任何限制',
+      gates
+    };
+  }
+  const limitMode = g3a.mode;
+  const expectedState = limitMode === 'stock' ? 'stock' : 'unlocked';
+  if (g3b && g3b.state !== expectedState) {
+    return {
+      supported: false,
+      targetKind,
+      mode: 'unknown',
+      reason: '上下文补丁状态不一致，请先恢复官方原版二进制文件',
+      gates
+    };
+  }
+  if (g3b) g3b.mode = limitMode;
+  return { supported: true, targetKind, mode: limitMode, gates };
 }
 
 function guardPatch(buf, image, funcs) {
-  const name = [...funcs.keys()].find(name => name.endsWith('genericsystemprompt.applyEdits'));
-  if (!name) return null;
+  const range = funcs.get(APPLY_EDITS);
+  if (!range) return null;
   if (image.arch !== 'x64') throw new Error('此版本的提示词初始化校验尚不支持修改');
-  const range = funcs.get(name);
   const prefix = hex('488b71104889742458488b711848897424384889d1');
   const offset = unique(buf, prefix, range.start, range.end);
   if (offset < 0 || buf[offset + prefix.length] !== 0xe8) throw new Error('无法识别提示词初始化校验');
@@ -279,7 +711,7 @@ function inspect(buf) {
     funcs = functions(buf, image);
     context = contextGates(buf, image, funcs);
   } catch (error) {
-    context = { supported: false, mode: 'unknown', reason: error.message, gates: [] };
+    context = { supported: false, targetKind: 'server', mode: 'unknown', reason: error.message, gates: [] };
   }
   // Unknown Go metadata also prevents reliably checking startup template edits.
   let promptError;
@@ -293,7 +725,13 @@ function inspect(buf) {
 export function inspectBinary(buf) {
   const { image, slots, context, promptError } = inspect(buf);
   return { format: image.format, arch: image.arch,
-    context: { ...context, gates: context.gates.map(({ id, mode, offset }) => ({ id, mode, offset })) },
+    context: {
+      supported: context.supported,
+      targetKind: context.targetKind,
+      mode: context.mode,
+      ...(context.reason ? { reason: context.reason } : {}),
+      gates: context.gates.map(({ id, mode, offset }) => ({ id, mode, offset }))
+    },
     templates: slots.map(({ offset, ...slot }) => ({ ...slot, editable: slot.editable && !promptError })),
     warning: promptError };
 }
@@ -304,13 +742,20 @@ export function patchBinary(buf, options, original = buf) {
   if (current.image.format !== baseline.image.format || current.image.arch !== baseline.image.arch) throw new Error('备份格式不匹配');
   const operations = [];
   if (options.contextMode !== undefined) {
-    const index = MODES.indexOf(options.contextMode);
-    if (index < 0) throw new Error('无效上下文模式');
+    if (!MODES.includes(options.contextMode)) throw new Error('无效上下文模式');
     if (!current.context.supported || !baseline.context.supported) throw new Error(current.context.reason || '备份上下文特征不受支持');
+    if (current.context.targetKind !== baseline.context.targetKind) throw new Error('备份目标类型不匹配');
+    if (options.contextMode === 'stock' && baseline.context.mode !== 'stock') {
+      throw new Error('缺少原生备份，无法恢复原生上下文指令');
+    }
     for (const gate of current.context.gates) {
-      const saved = baseline.context.gates.find(g => g.id === gate.id && g.offset === gate.offset);
+      const saved = baseline.context.gates.find(g => g.id === gate.id && g.offset === gate.offset && g.length === gate.length);
       if (!saved) throw new Error('备份补丁位置不匹配');
-      operations.push({ offset: gate.offset, bytes: gate.variants[index] });
+      const bytes = options.contextMode === 'stock'
+        ? original.subarray(saved.offset, saved.offset + saved.length)
+        : gate.encode(options.contextMode, saved);
+      if (bytes.length !== gate.length) throw new Error('补丁长度不匹配，拒绝修改');
+      operations.push({ offset: gate.offset, bytes });
     }
   }
   const changingPrompts = options.templates !== undefined || options.restorePrompts;

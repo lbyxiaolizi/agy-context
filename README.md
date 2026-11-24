@@ -68,14 +68,16 @@
 
 ### 4. 内核设置 (上下文解锁 · 内置提示词编辑)
 
-第三个主标签页「内核设置」针对本地语言服务器 (Language Server) 可执行文件提供上下文窗口解锁与内置提示词 (System Prompt) 编辑能力。实现思路参考开源项目 [agy-tool](https://github.com/justhil/agy-tool)（本项目为独立实现，未复制其任何预设内容）。
+第三个主标签页「内核设置」针对本地语言服务器 (`language_server`) 以及独立终端版 `agy` CLI 可执行文件提供上下文窗口解锁与内置提示词 (System Prompt) 编辑能力。实现思路参考开源项目 [agy-tool](https://github.com/justhil/agy-tool) 与上游 [q1uuuu/agy-context](https://github.com/q1uuuu/agy-context) 的 `agy-patch.py`（本项目以零外部依赖的纯 Node.js 独立实现，未复制其任何预设内容）。
 
 * **能力完全基于自动检测，不做任何服务端保证**：
-  - 进入页面时自动扫描候选目标文件并识别其二进制格式与架构（Mach-O / ELF / PE，arm64 / x64 等）；只有在二进制中定位到完整、唯一且已知的上下文指令特征 (Context Gates) 时才开放修改入口。
-  - **能否修改取决于本地文件能否被正确解析**：Antigravity 服务端版本更新后特征可能变化、检测可能失败；检测不通过时对应功能整体禁用（fail-closed），绝不会盲写文件，也不承诺任何特定版本可用。
+  - 进入页面时自动扫描候选目标文件（Desktop / IDE `language_server` 与跨平台 `agy` CLI，包括 macOS Homebrew / Linux / Windows 路径）并识别其二进制格式与架构（Mach-O / ELF / PE，arm64 / x64）；只有在二进制中定位到完整、唯一且已知的上下文指令特征 (Context Gates) 时才开放修改入口。
+  - **能否修改取决于本地文件能否被正确解析**：Antigravity 版本更新后特征可能变化、检测可能失败；检测不通过或门控状态不一致时对应功能整体禁用（fail-closed），绝不会盲写文件，也不承诺任何特定版本可用。
   - 所有修改都要求携带检测时返回的内容指纹 (`expectedHash`) 做乐观并发校验，文件在检测后发生任何变化都会被拒绝写入。
-* **上下文窗口解锁 (原生 / 512K / 900K)**：
-  - 512K 模式将压缩回退预算与显示上限设为 **512,000** tokens；900K 模式将压缩回退预算设为 **900,000** tokens，客户端界面显示约 **983,040**。
+* **多关卡上下文窗口解锁 (原生 / 512K / 900K / 动态上限 Dynamic)**：
+  - **Server (`language_server`)**：自动适配 **Gate 3A**（`utils.GetCheckpointConfig` 动态寄存器与钳制指令重写）与 **Gate 3B**（`config.applyFeatureProviderCheckpointOverrideConfig` 阻止实验 Checkpointer 将 `max_token_limit` 重置回 256K）。
+  - **`agy` CLI**：除 Gate 3A / 3B 外，额外联动解锁 **Gate 1**（`model.SelectorModel.offersContextWindow`，对所有模型开放 `/model` 菜单的 `[Default] [256K] [512K] [900K]` 档位切换）与 **Gate 2**（`store.(*Store).ContextWindow` 绕过 Argon 白名单并安全转发至 `ContextWindowChoice`，同步写入 `~/.gemini/antigravity-cli/settings.json` 与 `~/.gemini/config/config.json`）。
+  - **模式说明**：`512K` 将压缩回退预算设为 **512,000** tokens；`900K` 将压缩回退预算设为 **900,000** tokens；**动态上限 (Dynamic)** 则完全移除客户端 256K 钳制，释放模型完整物理预算（例如 1M 上下文 / 64K 输出模型约 **983,040** tokens，CLI 对应 `Default` 档位）。
   - **服务端模型自身的真实限额不会被修改**：超出当前所选模型服务端上限的请求仍可能被服务端拒绝或截断，本插件不提供也无法承诺绕过服务端限制。
 * **内置提示词编辑器 (纯文本)**：
   - 从检测结果加载各内置提示词模板：编辑器实时显示 UTF-8 字节占用与槽位容量，超限时禁止保存；身份 (identity) 等关键模板为只读，仅可查看。
@@ -87,9 +89,9 @@
   - 备份保存在 `~/.gemini/agy-context-backups`，独立于插件目录，插件更新不会覆盖它。可通过 `AGY_CONTEXT_BACKUP_DIR` 指定其他目录；`AGY_CONTEXT_BINARY` 可指定未被自动发现的内核文件。
 * **重启与签名须知**：
   - 所有写入磁盘的修改都需**手动重启 Antigravity** 才生效：面板分别显示磁盘状态与当前会话官方遥测，写入后提示重启。会话上限不能证明提示词或所选内核已经重新载入；设置页面不定时轮询，也不会自动结束或重启进程。
-  - macOS 上写入修改会替换可执行文件的原有签名（以 ad-hoc 方式对落盘文件重签），属预期行为。
-  - Antigravity 应用更新后请重新扫描。文件指纹与上次修改记录不符时，修改和恢复都会被拒绝，避免将旧备份写入新版内核；备份会保留供人工恢复使用。
-  - 确认文件变化来自官方升级后，可将 `AGY_CONTEXT_BACKUP_DIR` 指向一个新的空目录并重启 Sidecar，为新版内核建立独立备份。保留旧备份，不要跨版本覆盖恢复。
+  - macOS 上写入修改会对暂存文件进行 ad-hoc 重签（保留原始 `Identifier`、Hardened Runtime 及 `allow-jit` 等 ad-hoc 安全 entitlements）；执行「恢复完整原始文件」时则直接写回官方原版字节与签名。
+  - Antigravity 或 `agy` CLI 应用更新后请重新扫描。文件指纹与上次修改记录不符时，旧版本备份会被禁止用于恢复（「恢复全部提示词」/「恢复完整原始文件」将被拒绝），避免将旧版文件写入新版内核。
+  - 若更新后的新文件为官方原版 (`stock`) 状态，直接应用新的上下文设置或保存提示词时，插件会自动退役旧版备份并以新版原厂程序重新建立基线备份；若文件在外部被非原版方式修改，仍会拒绝修改以保护已有备份。
 
 本功能的回归检查：`node --test scripts/binary-patcher.test.mjs`。测试使用临时二进制样本、独立配置与备份目录，不修改已安装的 Antigravity。
 

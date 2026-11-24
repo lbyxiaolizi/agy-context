@@ -25,7 +25,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import { execFileSync, execSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { inspectBinary, patchBinary } from './binary-patcher.mjs';
 
@@ -34,8 +34,8 @@ const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const HOME = os.homedir();
 
 /** Context window modes accepted by applyCustomization(). */
-export const CONTEXT_MODES = ['stock', '512k', '900k'];
-const CONTEXT_WINDOW_CONFIG_VALUES = { '512k': '512K', '900k': '900K' };
+export const CONTEXT_MODES = ['stock', '512k', '900k', 'dynamic'];
+const CONTEXT_WINDOW_CONFIG_VALUES = { '512k': '512K', '900k': '900K', 'dynamic': '' };
 const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
 
 /**
@@ -115,22 +115,42 @@ export function resetTargetDiscoveryCache() {
   targetCache = null;
 }
 
-/** Resolves the standalone Windows agy.exe: %LOCALAPPDATA%\agy\bin\agy.exe, then `where.exe agy.exe`. */
-function resolveWindowsStandaloneAgy(localAppData) {
-  const defaultPath = path.join(localAppData, 'agy', 'bin', 'agy.exe');
-  if (pathExists(defaultPath)) return defaultPath;
+function resolveSymlinkIfExists(p) {
   try {
-    const out = execSync('where.exe agy.exe', {
+    if (fs.lstatSync(p).isSymbolicLink()) return fs.realpathSync(p);
+  } catch {}
+  return p;
+}
+
+function findCommandOnPath(cmd) {
+  const whichCmd = process.platform === 'win32' ? 'where.exe' : 'which';
+  try {
+    const out = execFileSync(whichCmd, [cmd], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 5000
+      timeout: 3000
     });
     for (const line of out.split(/\r?\n/)) {
       const p = line.trim();
       if (p && pathExists(p)) return p;
     }
   } catch {}
-  return defaultPath;
+  return null;
+}
+
+/** Resolves the standalone Windows agy.exe across common install paths and PATH. */
+function resolveWindowsStandaloneAgy(localAppData) {
+  const candidates = [
+    path.join(localAppData, 'agy', 'bin', 'agy.exe'),
+    path.join(HOME, '.local', 'bin', 'agy.exe'),
+    path.join(HOME, '.gemini', 'antigravity', 'bin', 'agy.exe'),
+    findCommandOnPath('agy.exe')
+  ].filter(Boolean);
+  for (const p of candidates) {
+    const resolved = resolveSymlinkIfExists(p);
+    if (pathExists(resolved)) return resolved;
+  }
+  return candidates[0];
 }
 
 /**
@@ -140,7 +160,9 @@ function resolveWindowsStandaloneAgy(localAppData) {
 export function discoverTargets() {
   if (targetCache) return targetCache;
   const raw = [];
-  const hubPath = path.join(HOME, '.gemini', 'bin', process.platform === 'win32' ? 'agy.exe' : 'agy');
+  const hubPath = resolveSymlinkIfExists(
+    path.join(HOME, '.gemini', 'bin', process.platform === 'win32' ? 'agy.exe' : 'agy')
+  );
 
   const custom = (process.env.AGY_CONTEXT_BINARY || '').trim();
   if (custom) {
@@ -148,10 +170,34 @@ export function discoverTargets() {
   }
 
   if (process.platform === 'darwin') {
+    const sysDesktop = '/Applications/Antigravity.app/Contents/Resources/bin/language_server';
+    const userDesktop = path.join(HOME, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'bin', 'language_server');
     raw.push({
       id: 'desktop',
       label: 'Antigravity Desktop 内核 (language_server)',
-      path: '/Applications/Antigravity.app/Contents/Resources/bin/language_server'
+      path: !pathExists(sysDesktop) && pathExists(userDesktop) ? userDesktop : sysDesktop
+    });
+    const cliCandidates = [
+      findCommandOnPath('agy'),
+      '/opt/homebrew/bin/agy',
+      path.join(HOME, '.local', 'bin', 'agy'),
+      path.join(HOME, '.gemini', 'antigravity', 'bin', 'agy'),
+      '/usr/local/bin/agy'
+    ].filter(Boolean);
+    const existingCli = [];
+    const seenCli = new Set();
+    for (const cand of cliCandidates) {
+      const resolved = resolveSymlinkIfExists(cand);
+      if (!pathExists(resolved)) continue;
+      const key = path.resolve(resolved);
+      if (seenCli.has(key)) continue;
+      seenCli.add(key);
+      existingCli.push(resolved);
+    }
+    const primaryCli = existingCli[0] || (pathExists('/opt/homebrew/bin') ? '/opt/homebrew/bin/agy' : path.join(HOME, '.local', 'bin', 'agy'));
+    raw.push({ id: 'cli', label: 'Antigravity CLI (agy)', path: primaryCli });
+    existingCli.slice(1).forEach((p, idx) => {
+      raw.push({ id: `cli_alt_${idx + 1}`, label: `Antigravity CLI (${p})`, path: p });
     });
     raw.push({ id: 'ide_hub', label: 'Antigravity IDE 2.6+ 后端 (~/.gemini/bin/agy)', path: hubPath });
   } else if (process.platform === 'win32') {
@@ -174,7 +220,7 @@ export function discoverTargets() {
         path: ideLegacyPath
       });
     }
-    if (pathExists(hubPath) && path.resolve(hubPath) !== path.resolve(cliPath)) {
+    if (pathExists(hubPath) && path.resolve(hubPath).toLowerCase() !== path.resolve(cliPath).toLowerCase()) {
       raw.push({ id: 'ide_hub', label: 'Antigravity IDE 2.6+ 后端 (~/.gemini/bin/agy.exe)', path: hubPath });
     }
   } else {
@@ -188,15 +234,21 @@ export function discoverTargets() {
       label: 'Antigravity Desktop 内核 (/opt/Antigravity)',
       path: '/opt/Antigravity/resources/bin/language_server'
     });
-    raw.push({ id: 'cli', label: 'Antigravity CLI (/usr/bin/agy)', path: '/usr/bin/agy' });
-    raw.push({ id: 'cli_local', label: 'Antigravity CLI (/usr/local/bin/agy)', path: '/usr/local/bin/agy' });
-    raw.push({ id: 'cli_user', label: 'Antigravity CLI (~/.local/bin/agy)', path: path.join(HOME, '.local', 'bin', 'agy') });
+    const pathAgy = findCommandOnPath('agy');
+    if (pathAgy) {
+      raw.push({ id: 'cli_path', label: `Antigravity CLI (${pathAgy})`, path: resolveSymlinkIfExists(pathAgy) });
+    }
+    raw.push({ id: 'cli', label: 'Antigravity CLI (/usr/bin/agy)', path: resolveSymlinkIfExists('/usr/bin/agy') });
+    raw.push({ id: 'cli_local', label: 'Antigravity CLI (/usr/local/bin/agy)', path: resolveSymlinkIfExists('/usr/local/bin/agy') });
+    raw.push({ id: 'cli_user', label: 'Antigravity CLI (~/.local/bin/agy)', path: resolveSymlinkIfExists(path.join(HOME, '.local', 'bin', 'agy')) });
+    raw.push({ id: 'cli_agy', label: 'Antigravity CLI (~/.gemini/antigravity/bin/agy)', path: resolveSymlinkIfExists(path.join(HOME, '.gemini', 'antigravity', 'bin', 'agy')) });
     raw.push({ id: 'ide_hub', label: 'Antigravity IDE 2.6+ 后端 (~/.gemini/bin/agy)', path: hubPath });
   }
 
   const seen = new Set();
   targetCache = raw.filter((t) => {
-    const k = path.resolve(t.path).toLowerCase();
+    const resolved = path.resolve(t.path);
+    const k = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
     if (seen.has(k)) return false;
     seen.add(k);
     return true;
@@ -305,29 +357,32 @@ export function inspectTarget(targetId) {
   let backupAvailable = false;
   let backupPath;
   let serviceWarning;
+  let staleBackup = false;
+  const canAutoRebaseline = !rest.context.supported || rest.context.mode === 'stock';
   if (entry) {
     const candidate = path.join(getBackupDir(), entry.backupFile);
-    if (pathExists(candidate)) {
-      const backupBuffer = fs.readFileSync(candidate);
-      if (computeSha256(backupBuffer) === entry.backupSha) {
-        backupAvailable = true;
-        backupPath = candidate;
+    const matchesTargetPath = entry.path === target.path;
+    const backupExists = pathExists(candidate);
+    const backupIntact = backupExists && computeSha256(fs.readFileSync(candidate)) === entry.backupSha;
+    const binaryChanged = Boolean(entry.lastAppliedSha && entry.lastAppliedSha !== rest.hash);
+    if (!matchesTargetPath || !backupExists || !backupIntact || binaryChanged) {
+      staleBackup = true;
+      if (backupIntact) backupPath = candidate;
+      if (canAutoRebaseline) {
+        serviceWarning = '检测到客户端已更新，当前文件为新版原厂状态；下次应用修改时将自动为新版创建备份（旧版备份不可用于恢复）。';
       } else {
-        serviceWarning = `Backup file failed its integrity check: ${candidate}`;
+        serviceWarning = '检测到目标二进制在外部被修改且非原版状态，为避免覆盖原有备份已阻止修改；请先恢复官方原版程序。';
       }
     } else {
-      serviceWarning = `Metadata references a missing backup file: ${candidate}`;
-    }
-    if (!serviceWarning && entry.lastAppliedSha && entry.lastAppliedSha !== rest.hash) {
-      serviceWarning =
-        'Binary changed externally since the last customization (Antigravity update?). ' +
-        'Apply/restore are refused until re-armed; the backup is kept in ' + getBackupDir();
+      backupAvailable = true;
+      backupPath = candidate;
     }
   }
   const warning = [coreWarning, serviceWarning].filter(Boolean).join(' | ') || undefined;
   return {
     ...rest,
     backupAvailable,
+    ...(staleBackup ? { staleBackup: true, canAutoRebaseline } : {}),
     ...(backupPath ? { backupPath } : {}),
     ...(warning ? { warning } : {})
   };
@@ -388,18 +443,91 @@ function validateApplyRequest(request) {
     if (typeof request.restoreAll !== 'boolean') throw new CustomizationError(400, 'restoreAll must be a boolean');
     if (request.restoreAll) opts.restoreAll = true;
   }
-  if (!opts.contextMode && !opts.templates && !opts.restorePrompts && !opts.restoreAll) {
-    throw new CustomizationError(400, 'Nothing to apply: provide contextMode, templates, restorePrompts, or restoreAll');
+  if (request.rebaseline !== undefined && request.rebaseline !== null) {
+    if (typeof request.rebaseline !== 'boolean') throw new CustomizationError(400, 'rebaseline must be a boolean');
+    if (request.rebaseline) opts.rebaseline = true;
   }
-  if (opts.restoreAll && (opts.contextMode || opts.templates || opts.restorePrompts)) {
+  if (!opts.contextMode && !opts.templates && !opts.restorePrompts && !opts.restoreAll && !opts.rebaseline) {
+    throw new CustomizationError(400, 'Nothing to apply: provide contextMode, templates, restorePrompts, restoreAll, or rebaseline');
+  }
+  if (opts.restoreAll && (opts.contextMode || opts.templates || opts.restorePrompts || opts.rebaseline)) {
     throw new CustomizationError(400, 'restoreAll cannot be combined with other options');
+  }
+  if (opts.rebaseline && (opts.contextMode || opts.templates || opts.restorePrompts || opts.restoreAll)) {
+    throw new CustomizationError(400, 'rebaseline cannot be combined with other options');
   }
   return opts;
 }
 
-function codesignStaged(stagedPath) {
+function extractCodesignIdentifier(referencePath) {
+  const res = spawnSync('codesign', ['-d', '--verbose=2', referencePath], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 10000
+  });
+  const combined = `${res.stderr || ''}\n${res.stdout || ''}`;
+  const m = combined.match(/^Identifier=(.+)$/m);
+  return (m && m[1].trim()) || path.basename(referencePath);
+}
+
+function extractSafeEntitlementsPlist(referencePath) {
+  const res = spawnSync('codesign', ['-d', '--entitlements', ':-', referencePath], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 10000
+  });
+  if (res.status !== 0 || !res.stdout) return null;
+  if (!res.stdout.toString('utf8').trimStart().startsWith('<?xml')) return null;
+
+  const jsonRes = spawnSync('plutil', ['-convert', 'json', '-o', '-', '-'], {
+    input: res.stdout,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 5000
+  });
+  if (jsonRes.status !== 0 || !jsonRes.stdout) return null;
+
+  let parsed;
   try {
-    execFileSync('codesign', ['--force', '--sign', '-', stagedPath], {
+    parsed = JSON.parse(jsonRes.stdout);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+
+  const filtered = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (
+      !k.startsWith('com.apple.developer.') &&
+      k !== 'keychain-access-groups' &&
+      k !== 'com.apple.application-identifier'
+    ) {
+      filtered[k] = v;
+    }
+  }
+  if (Object.keys(filtered).length === 0) return null;
+
+  const tmpPath = path.join(os.tmpdir(), `agy-ent-${process.pid}-${crypto.randomBytes(4).toString('hex')}.plist`);
+  const xmlOut = spawnSync('plutil', ['-convert', 'xml1', '-o', tmpPath, '-'], {
+    input: JSON.stringify(filtered),
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 5000
+  });
+  if (xmlOut.status !== 0) {
+    safeUnlink(tmpPath);
+    return null;
+  }
+  return tmpPath;
+}
+
+function codesignStaged(stagedPath, referencePath) {
+  const identifier = extractCodesignIdentifier(referencePath);
+  const entPath = extractSafeEntitlementsPlist(referencePath);
+  try {
+    const args = ['--force', '--sign', '-', '--options', 'runtime', '--identifier', identifier];
+    if (entPath) args.push('--entitlements', entPath);
+    args.push(stagedPath);
+    execFileSync('codesign', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 60000
     });
@@ -409,6 +537,8 @@ function codesignStaged(stagedPath) {
       500,
       `macOS ad-hoc codesign failed on staged binary ${stagedPath}${stderr ? `: ${stderr}` : ` (${err.message})`}`
     );
+  } finally {
+    if (entPath) safeUnlink(entPath);
   }
 }
 
@@ -435,7 +565,7 @@ function stageBinary(targetPath, buffer, mode, adhocSign) {
   try {
     fs.writeFileSync(stagedPath, buffer);
     fs.chmodSync(stagedPath, mode & 0o777);
-    if (adhocSign) codesignStaged(stagedPath);
+    if (adhocSign) codesignStaged(stagedPath, targetPath);
     return { stagedPath, finalBuffer: fs.readFileSync(stagedPath) };
   } catch (err) {
     safeUnlink(stagedPath);
@@ -443,11 +573,40 @@ function stageBinary(targetPath, buffer, mode, adhocSign) {
   }
 }
 
-/** Atomically moves a staged file over the target. */
+function cleanupStaleOldFiles(dir, base) {
+  const prefix = `.${base}.agy-old-`;
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (name.startsWith(prefix)) safeUnlink(path.join(dir, name));
+    }
+  } catch {}
+}
+
+/** Atomically moves a staged file over the target (with Windows running-binary rename-away fallback). */
 function commitStaged(staged, targetPath) {
   try {
     fs.renameSync(staged.stagedPath, targetPath);
   } catch (err) {
+    if (process.platform === 'win32' && ['EPERM', 'EACCES', 'EBUSY'].includes(err.code)) {
+      const dir = path.dirname(targetPath);
+      const base = path.basename(targetPath);
+      cleanupStaleOldFiles(dir, base);
+      const oldPath = path.join(dir, `.${base}.agy-old-${process.pid}-${crypto.randomBytes(4).toString('hex')}`);
+      try {
+        fs.renameSync(targetPath, oldPath);
+        try {
+          fs.renameSync(staged.stagedPath, targetPath);
+        } catch (innerErr) {
+          try { fs.renameSync(oldPath, targetPath); } catch {}
+          throw innerErr;
+        }
+        safeUnlink(oldPath);
+        return;
+      } catch (winErr) {
+        safeUnlink(staged.stagedPath);
+        throw translateStageError(winErr, targetPath);
+      }
+    }
     safeUnlink(staged.stagedPath);
     throw translateStageError(err, targetPath);
   }
@@ -560,9 +719,13 @@ function buildApplyMessage(opts) {
     parts.push('reverted contextWindow settings changed by this plugin');
   } else {
     if (opts.contextMode) {
-      parts.push(opts.contextMode === 'stock'
-        ? 'context window restored to stock limits'
-        : `context window unlocked to ${opts.contextMode.toUpperCase()}`);
+      parts.push(
+        opts.contextMode === 'stock'
+          ? 'context window restored to stock limits'
+          : opts.contextMode === 'dynamic'
+            ? 'context window unlocked to DYNAMIC (full model budget)'
+            : `context window unlocked to ${opts.contextMode.toUpperCase()}`
+      );
     }
     if (opts.templates) parts.push(`updated ${Object.keys(opts.templates).length} prompt template(s)`);
     if (opts.restorePrompts) parts.push('restored stock prompt templates');
@@ -590,24 +753,51 @@ async function applyLocked(request) {
     );
   }
 
-  // External version change (e.g. Antigravity update): refuse instead of using a stale backup.
+  // External version change (e.g. Antigravity update): allow explicit re-baseline if stock,
+  // otherwise refuse instead of patching/restoring a stale backup.
   let entry = meta.targets[key];
-  if (entry) {
-    if (entry.path !== target.path) {
-      throw new CustomizationError(
-        409,
-        `Target path changed since the last customization (was ${entry.path}); refusing to reuse the stale backup.`
-      );
+  if (opts.rebaseline) {
+    let currentInfo;
+    try {
+      currentInfo = inspectBinary(currentBuffer);
+    } catch (err) {
+      throw new CustomizationError(422, `Binary analysis failed for ${target.path}: ${err.message}`);
     }
-    if (entry.lastAppliedSha && entry.lastAppliedSha !== currentSha) {
-      throw new CustomizationError(
-        409,
-        `Binary was modified externally since the last customization (likely an Antigravity update) — refusing to patch or restore a stale backup. The backup is kept in ${getBackupDir()}.`
-      );
+    if (currentInfo.context && currentInfo.context.supported && currentInfo.context.mode !== 'stock') {
+      throw new CustomizationError(400, '当前磁盘文件并非原版 (stock) 状态，无法重置为原始备份基线');
+    }
+    if (entry) {
+      safeUnlink(path.join(getBackupDir(), entry.backupFile));
+      delete meta.targets[key];
+      writeMetadata(meta);
+    }
+    return {
+      ...inspectTarget(target.id),
+      message: '已清理旧版备份记录，当前原版文件将在下次修改时自动作为新基线备份。',
+      restartRequired: false
+    };
+  }
+
+  let entryStale = false;
+  if (entry) {
+    const candPath = path.join(getBackupDir(), entry.backupFile);
+    if (
+      entry.path !== target.path ||
+      (entry.lastAppliedSha && entry.lastAppliedSha !== currentSha) ||
+      !pathExists(candPath) ||
+      computeSha256(fs.readFileSync(candPath)) !== entry.backupSha
+    ) {
+      entryStale = true;
     }
   }
 
   const restoreAll = Boolean(opts.restoreAll);
+  if (entryStale && (restoreAll || opts.restorePrompts)) {
+    throw new CustomizationError(
+      409,
+      'Binary was modified externally since the last customization (likely an Antigravity update) — refusing to restore a stale backup.'
+    );
+  }
 
   // 1) Core validation against the CURRENT binary.
   let currentInfo;
@@ -643,11 +833,22 @@ async function applyLocked(request) {
   const wantsConfigSync = Boolean(opts.contextMode) || restoreAll;
   const configPlan = wantsConfigSync ? prepareContextWindowConfigs(opts, meta) : null;
 
-  // 3) Full original backup (first mutation only, AFTER all validation passed),
-  //    kept outside the plugin directory. Its metadata is persisted immediately
-  //    so a later failure or crash never orphans the baseline, and an existing
-  //    backup is never overwritten by a failed attempt.
+  // 3) Full original backup (first mutation or silent auto-rebaseline after official
+  //    stock update, AFTER all validation passed), kept outside the plugin directory.
   const backupDir = ensureBackupDir();
+  if (entryStale) {
+    const canAutoRebaseline = !currentInfo.context || !currentInfo.context.supported || currentInfo.context.mode === 'stock';
+    if (!canAutoRebaseline) {
+      throw new CustomizationError(
+        409,
+        'Binary was modified externally and is not in stock state — refusing to overwrite the existing backup.'
+      );
+    }
+    safeUnlink(path.join(backupDir, entry.backupFile));
+    delete meta.targets[key];
+    entry = null;
+  }
+
   let backupBuffer;
   if (entry) {
     const backupPath = path.join(backupDir, entry.backupFile);
